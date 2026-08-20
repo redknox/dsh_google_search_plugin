@@ -58,7 +58,21 @@ rules of the road; [ARCHITECTURE.md](ARCHITECTURE.md) is the map.
 - **SHOULD** keep the evidence reproducible: the command, the input, and the observed
   output.
 
-## 6. Error handling
+## 6. Provider / product choice behind the adapter boundary
+
+- **MUST** keep the choice of concrete Google search API/product an **adapter-layer**
+  decision. The Harness-facing search domain contract (the seam types) must not encode a
+  specific Google endpoint, parameter set, or wire shape.
+- **MUST NOT** require changes to the Harness-facing search domain contract in order to
+  migrate to, or add, a different Google search API/product. Such a change is a new or
+  re-pointed adapter behind the same `WebSearchProvider` interface.
+- **SHOULD** keep the Harness-facing search contract stable across future Google API
+  variants when possible; where a variant cannot be expressed without a domain change,
+  that trade-off must be called out explicitly in the issue, not done silently.
+- **MUST NOT** implement multiple Google APIs or a Google-API abstraction layer in an
+  issue that does not require it (see §3 — smallest useful release).
+
+## 7. Error handling
 
 - **MUST** propagate provider failures as **structured errors** with a machine-routable
   code, not as thrown strings or swallowed exceptions.
@@ -66,7 +80,7 @@ rules of the road; [ARCHITECTURE.md](ARCHITECTURE.md) is the map.
 - **SHOULD** distinguish *capability unavailable* (no usable provider / missing
   credential) from *request failed* (the provider was reached and returned an error).
 
-## 7. Tests
+## 8. Tests
 
 - **MUST** add or update tests alongside behavior changes; a behavior change with no test
   is incomplete.
@@ -74,7 +88,7 @@ rules of the road; [ARCHITECTURE.md](ARCHITECTURE.md) is the map.
   recorded fixtures, so tests do not depend on live network access.
 - **MUST NOT** write tests that require live Google credentials to pass in CI.
 
-## 8. Documentation
+## 9. Documentation
 
 - **MUST** keep `README.md`, `ENGINEERING.md`, and `ARCHITECTURE.md` accurate when the
   contracts they describe change.

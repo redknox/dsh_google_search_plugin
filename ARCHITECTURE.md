@@ -64,12 +64,14 @@ specific provider. Its job:
    actually returns and leaving absent fields `undefined`.
 4. Report a cheap, local `available()` (no network calls) and forward `signal` for
    cancellation.
-5. Map Google failures to structured errors (see ENGINEERING.md §6).
+5. Map Google failures to structured errors (see ENGINEERING.md §7).
 
-The concrete Google endpoint (for example the [Custom Search
-JSON API](https://developers.google.com/custom-search/v1)) is an implementation detail of
-this layer. Swapping or adding a backend later means writing a new adapter — it must not
-touch the domain layer or the tool layer.
+The concrete Google search **product/API** is an **adapter-layer choice**. The initial
+target for the MVP is Google Programmable Search — Custom Search JSON API (recorded in
+"Initial Google backend target (MVP)" below). Swapping or adding a backend later —
+including migrating to another Google search API/product — means writing a new (or
+re-pointed) adapter against the same seam; it must not touch the domain layer or the tool
+layer.
 
 ### 4. Google Search API
 
@@ -80,6 +82,35 @@ The external, third-party API. It is **outside** the repository's contract surfa
   committed** (ENGINEERING.md §4);
 - claims about its behavior require verification evidence (ENGINEERING.md §5).
 
+## Initial Google backend target (MVP)
+
+The initial Google backend target for the MVP is **Google Programmable Search —
+[Custom Search JSON API](https://developers.google.com/custom-search/v1) semantics**: a
+REST search endpoint that takes a query string and returns a list of result items with
+url, title, and snippet fields, which map onto `WebSearchSource`.
+
+**Configuration shape (contract, not values).** The adapter's runtime configuration
+requires:
+
+| Setting | Kind | Notes |
+|---|---|---|
+| API credential | secret, runtime-only | Supplied via environment variable(s) at runtime; **never committed**, never stored in ordinary settings (ENGINEERING.md §4). This document names the *shape* of the requirement, not a specific variable name, and never a value. |
+| Search engine id (`cx`) | non-secret, runtime-only | Required where the selected Google product requires it (Custom Search JSON API requires a `cx` identifying the Programmable Search Engine). Environment-specific ids are deployment data, **not** repository contract data: no real `cx` value is recorded here or in any checked-in default. |
+
+Recorded here is the **shape** of the configuration (credential + `cx` where the
+selected Google product requires it). Real credential values and environment-specific
+ids are deployment data and must not appear in this repository's contract documents,
+config defaults, or examples.
+
+**Adapter-layer choice.** The concrete Google search product/API is an adapter-layer
+choice, not a domain decision. A future migration to, or addition of, another Google
+search API/product (for example a different Google search endpoint with different
+parameters, pagination, or result fields) is an adapter concern: it is expressed as a new
+or re-pointed adapter behind the same `WebSearchProvider` interface, and **must not
+require changes to the Harness-facing search domain contract** (the seam types in §2).
+This issue records that boundary only; it does **not** implement multiple Google APIs or
+a Google-API abstraction layer (see Non-goals).
+
 ## Google is the first planned backend, not the domain contract
 
 **Google is the initial backend for the MVP (the first planned search backend) — not the
@@ -87,8 +118,14 @@ internal domain contract.** The domain contract is the provider-neutral search s
 described in §2. Google is *one* implementation of it. Consequences:
 
 - The domain model is defined by the seam types, not by Google's response shape.
-- A second backend (a different provider) is a new adapter against the same seam, not a
-  refactor of the domain.
+- A different search provider (another vendor) is a new adapter against the same seam,
+  not a refactor of the domain.
+- A **future Google search API/product variant** (a different Google search endpoint or
+  product, with different parameters, pagination, or result fields) is likewise an
+  adapter-layer change: a new or re-pointed adapter behind the same `WebSearchProvider`
+  interface. The Harness-facing search domain contract stays stable across Google API
+  variants; migrating between them must not change the seam types in §2 or the
+  tool-facing contract in §1.
 - Nothing in layers 1–2 may depend on Google. The dependency arrow points one way only:
   adapter → Google.
 
@@ -126,18 +163,26 @@ The first release (MVP) delivers exactly:
      `publishedAt?`), leaving absent fields `undefined`;
    - `available()` returns a cheap local check (e.g. credential present) without
      network access.
-3. Credentials read from **environment variables** at runtime; a clear structured error
-   when missing.
+3. Runtime configuration per the shape recorded in "Initial Google backend target
+   (MVP)": an API credential and, where the selected Google product requires it, a search
+   engine id (`cx`) — both supplied at runtime, never committed, with a clear structured
+   error when missing.
 4. Tests for the mapping logic using recorded fixtures (no live network in CI).
 
 ## Non-goals (first release)
 
 - **No Fetch/Read capability.** No `WebFetchProvider`, no page-content retrieval.
+- **No claim that the Google backend is validated/verified.** That wording is reserved
+  for after live verification provides evidence (Issue #7).
+- **No implementation of multiple Google APIs** in this issue. Only the adapter boundary
+  is preserved so a future migration to, or addition of, another Google search
+  API/product can be done without touching the domain contract, when a real requirement
+  appears.
 - **No multi-provider abstraction** beyond the minimum domain boundary required to avoid
   Google wire coupling (the seam already provides that boundary; this plugin adds no
   framework of its own).
 - **No new model-facing tools.** Only a provider for the existing `web_search` tool.
-- **No credentials storage** in settings, config defaults, or the repository.
+- **No credentials or `cx` values** in settings, config defaults, or the repository.
 - **No automatic follow-up fetches** of search results.
 - **No UI/presentation changes.** Presentation is owned by the DSH tool layer.
 

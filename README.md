@@ -14,9 +14,14 @@ in later issues, its runtime implementation.
 - It registers a **search provider** — a small adapter that turns a normalized search
   request into a Google search call and maps Google's response back to the normalized
   search result.
-- **Google** is the **initial backend for the MVP** (the first planned search backend).
-  The concrete Google endpoint (for example the Custom Search JSON API) is an
-  implementation detail of the adapter, not part of the domain contract.
+- **Google** is the **initial planned backend for the MVP** (the first planned search
+  backend). The initial target is Google Programmable Search — Custom Search JSON API
+  semantics; the concrete Google search product/API is an **adapter-layer choice** and
+  not part of the domain contract.
+- Its runtime configuration requires an **API credential** and, where the selected Google
+  product requires it, a **search engine id (`cx`)** — supplied at runtime, never
+  committed (see [ARCHITECTURE.md](ARCHITECTURE.md), "Initial Google backend target
+  (MVP)").
 - It speaks the stable, **provider-neutral search domain contract**. Google's wire
   format stays inside the adapter and never leaks into the domain model.
 - It is **search-only** in its first release: it makes the model-facing `web_search`
@@ -31,7 +36,9 @@ in later issues, its runtime implementation.
   **provider** to the existing `web_search` tool through `ctx.web.registerSearchProvider`.
 - **Not a multi-provider abstraction layer.** Google is the first planned backend. The
   domain boundary is kept just wide enough to avoid coupling the domain model to Google's
-  wire format — nothing more.
+  wire format — nothing more. That boundary is what keeps a future migration to, or
+  addition of, another Google search API/product an adapter-layer change that does not
+  touch the Harness-facing search domain contract.
 - **Not a credentials store.** Google API credentials are supplied at runtime via
   environment variables. They are **never committed** and **never stored in ordinary
   settings** (see [ENGINEERING.md](ENGINEERING.md)).
@@ -42,7 +49,7 @@ in later issues, its runtime implementation.
 |---|---|
 | `README.md` | Product positioning — what the plugin is and is not (this file). |
 | `ENGINEERING.md` | Normative engineering principles for human and AI contributors. |
-| `ARCHITECTURE.md` | The stable domain vs external-provider boundary, the Search / Fetch-Read capability split, and first-release scope + non-goals. |
+| `ARCHITECTURE.md` | The stable domain vs external-provider boundary, the initial Google backend target (MVP) and its configuration shape, the Search / Fetch-Read capability split, and first-release scope + non-goals. |
 
 ## Status
 
