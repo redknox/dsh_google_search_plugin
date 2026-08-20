@@ -1,7 +1,7 @@
 # dsh-google-search-plugin
 
 A **DeepSeek Harness (DSH) plugin** that gives the agent a working web-search tool by
-registering **Google** as the first validated search backend behind DSH's web capability
+registering **Google** as the first planned search backend behind DSH's web capability
 seam (`ctx.web`).
 
 This repository is the home of the plugin's engineering and architecture contracts, and,
@@ -14,8 +14,8 @@ in later issues, its runtime implementation.
 - It registers a **search provider** — a small adapter that turns a normalized search
   request into a Google search call and maps Google's response back to the normalized
   search result.
-- **Google** is the **first** search backend this plugin validates against. The
-  concrete Google endpoint (for example the Custom Search JSON API) is an
+- **Google** is the **initial backend for the MVP** (the first planned search backend).
+  The concrete Google endpoint (for example the Custom Search JSON API) is an
   implementation detail of the adapter, not part of the domain contract.
 - It speaks the stable, **provider-neutral search domain contract**. Google's wire
   format stays inside the adapter and never leaks into the domain model.
@@ -29,9 +29,9 @@ in later issues, its runtime implementation.
   release implements **search only**; Fetch/Read is out of scope.
 - **Not a new model-facing tool.** It does not invent a new tool schema. It supplies a
   **provider** to the existing `web_search` tool through `ctx.web.registerSearchProvider`.
-- **Not a multi-provider abstraction layer.** Google is the first backend. The domain
-  boundary is kept just wide enough to avoid coupling the domain model to Google's wire
-  format — nothing more.
+- **Not a multi-provider abstraction layer.** Google is the first planned backend. The
+  domain boundary is kept just wide enough to avoid coupling the domain model to Google's
+  wire format — nothing more.
 - **Not a credentials store.** Google API credentials are supplied at runtime via
   environment variables. They are **never committed** and **never stored in ordinary
   settings** (see [ENGINEERING.md](ENGINEERING.md)).

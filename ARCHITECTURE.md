@@ -80,17 +80,22 @@ The external, third-party API. It is **outside** the repository's contract surfa
   committed** (ENGINEERING.md §4);
 - claims about its behavior require verification evidence (ENGINEERING.md §5).
 
-## Google is the first backend, not the domain contract
+## Google is the first planned backend, not the domain contract
 
-**Google is the first validated search backend for this plugin — not the internal domain
-contract.** The domain contract is the provider-neutral search seam described in §2.
-Google is *one* implementation of it. Consequences:
+**Google is the initial backend for the MVP (the first planned search backend) — not the
+internal domain contract.** The domain contract is the provider-neutral search seam
+described in §2. Google is *one* implementation of it. Consequences:
 
 - The domain model is defined by the seam types, not by Google's response shape.
 - A second backend (a different provider) is a new adapter against the same seam, not a
   refactor of the domain.
 - Nothing in layers 1–2 may depend on Google. The dependency arrow points one way only:
   adapter → Google.
+
+> **Evidence-matched wording.** As of Issue #1 (contracts only) there is no runtime
+> implementation and no live Google API call, so Google is described as *planned* /
+> *initial*, not *validated*. Per ENGINEERING.md §5, the wording is upgraded to
+> "validated" only once real Google API + Harness E2E evidence exists (Issue #7).
 
 ## Search and Fetch/Read are separate capabilities
 
