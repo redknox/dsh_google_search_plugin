@@ -94,6 +94,26 @@ rules of the road; [ARCHITECTURE.md](ARCHITECTURE.md) is the map.
   contracts they describe change.
 - **SHOULD** keep documentation short and normative; link to it instead of duplicating it.
 
+## 10. Per-issue working protocol
+
+This protocol is the standing, long-term memory of how work proceeds in this
+repository. It is normative for every issue round — human or AI — and
+supersedes any earlier instruction to batch several issues in one round.
+
+- **MUST** read `README.md`, `ENGINEERING.md`, and `ARCHITECTURE.md` first, then
+  read the current issue. The three documents are the context; the issue text is
+  the task.
+- **MUST** complete exactly **one** issue per round.
+- **MUST NOT** start, scaffold, or partially do the next issue in the same round —
+  no "while I'm at it" work beyond the current issue's scope.
+- **MUST** report, at the end of the round: the changes made; the Acceptance
+  comparison (each acceptance criterion met or not, with evidence); the test
+  results; and any uncertain items.
+
+Source (verbatim): "先读 README.md、ENGINEERING.md、ARCHITECTURE.md，再读当前 Issue；
+只完成这一个 Issue；禁止顺手做下一个 Issue；结束时报告改动、Acceptance 对照、测试
+结果和不确定项。"
+
 ## Definition of done (per issue)
 
 An issue is complete only when:
