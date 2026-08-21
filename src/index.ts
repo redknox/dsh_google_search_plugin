@@ -1,43 +1,25 @@
 /**
- * DSH plugin entry (Issue #2).
+ * DSH plugin entry (Issue #2) — provider-only.
  *
- * Registers the provider-neutral `web_search` tool through public DSH
- * extension contracts only — the Cordis `Context` and the `tools` /
- * `systemPrompt` services — with no Agent Loop internals and no private
- * imports (Issue #2 acceptance).
+ * Registers the Google search provider on the web capability seam
+ * (`ctx.web`, `@deepseek-ai/dsh-web`) through public DSH extension
+ * contracts only — the Cordis `Context` and the `web` service — with no
+ * Agent Loop internals and no private imports (Issue #2 acceptance).
  *
- * Lifecycle: both registrations are fiber-scoped effects. Cordis disposes
- * them automatically when the plugin's fiber unloads, so no manual teardown
- * is required (the same lifecycle the reference `dsh-tool-web` plugin
- * relies on).
+ * This plugin does **not** own a model-facing tool. The `web_search` tool,
+ * its schema, and its prompt guidance are owned by
+ * `@deepseek-ai/dsh-tool-web`; this plugin only supplies a search backend
+ * to that existing tool (ARCHITECTURE.md).
  *
- * NOTE (architecture conflict, flagged for review): the committed
- * ARCHITECTURE.md/README.md describe a provider-only plugin (no new
- * model-facing tool). Per the maintainer's decision for this round, the
- * plugin registers its own `web_search` tool as Issue #2 literally
- * specifies; the docs need a post-review revision to match.
+ * Lifecycle: `ctx.web.registerSearchProvider` returns a disposer that is
+ * disposed with the calling fiber, so Cordis unregisters the provider
+ * automatically when the plugin's fiber unloads — no manual teardown.
  */
 
 import type { Context, Plugin } from "@deepseek-ai/cordis";
-import { buildWebSearchTool, WEB_SEARCH_TOOL_NAME } from "./tool/web-search.js";
+import { buildGoogleSearchProvider, GOOGLE_SEARCH_PROVIDER_ID } from "./provider/google.js";
 
-export { WEB_SEARCH_TOOL_NAME } from "./tool/web-search.js";
-
-/**
- * Guidance section for the `web_search` tool. Registered wherever the
- * tool is registered so the model always sees the same contract.
- */
-function webSearchGuidance(): string {
-	return [
-		"Use web_search to find current information on the web. Provide a single",
-		"query; optionally bound the result count (limit) and express language,",
-		"region, and safe-search preferences. Results are citeable sources with a",
-		"url, and a title/snippet/source when the search backend supplies them.",
-		"Prefer the most recent, authoritative source for time-sensitive facts.",
-		`Note: this deployment has no search backend wired in yet — calls to ${WEB_SEARCH_TOOL_NAME}`,
-		"fail with a structured 'capability_unavailable' error until one is configured."
-	].join(" ");
-}
+export { buildGoogleSearchProvider, GOOGLE_SEARCH_PROVIDER_ID } from "./provider/google.js";
 
 /**
  * The plugin. `inject` declares the services the plugin requires; it only
@@ -45,16 +27,11 @@ function webSearchGuidance(): string {
  */
 export const googleSearchPlugin: Plugin.Object = {
 	name: "google-search",
-	inject: ["tools", "systemPrompt"],
+	inject: ["web"],
 	apply(ctx: Context) {
-		ctx.systemPrompt.section({
-			name: "tool:web_search",
-			order: 110,
-			text: webSearchGuidance()
-		});
-		// The returned disposer is fiber-scoped: Cordis unregisters the tool
-		// when this plugin's fiber disposes. No manual teardown needed.
-		ctx.tools.register(buildWebSearchTool());
+		// The returned disposer is fiber-scoped: Cordis unregisters the
+		// provider when this plugin's fiber disposes. No manual teardown needed.
+		ctx.web.registerSearchProvider(buildGoogleSearchProvider());
 	}
 };
 

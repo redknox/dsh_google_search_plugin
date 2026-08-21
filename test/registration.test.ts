@@ -1,160 +1,151 @@
 /**
- * Issue #2 acceptance tests: the plugin loads through public DSH/Cordis
- * contracts, the harness can discover the search tool, the tool's input and
- * output are provider-neutral, and teardown is lifecycle-safe.
+ * Issue #2 acceptance tests — provider-only (ARCHITECTURE.md).
+ *
+ * The plugin registers a `WebSearchProvider` on the `ctx.web` seam
+ * (`@deepseek-ai/dsh-web`). Registration and unload are verified **through
+ * the seam's public API** — its provider-selection error codes — never by
+ * reaching into private registry internals, and never by asserting a
+ * plugin-owned tool (the `web_search` tool is owned by
+ * `@deepseek-ai/dsh-tool-web`).
  *
  * No network, no Google, no credentials — a bare Cordis `Context` with the
- * two required services, exactly as the public contracts allow.
+ * one required service (`web`), exactly as the public contracts allow.
  */
 
 import test from "node:test";
 import assert from "node:assert/strict";
 
 import { Context } from "@deepseek-ai/cordis";
-import { ToolRuntime } from "@deepseek-ai/dsh-tools";
-import { SystemPrompt } from "@deepseek-ai/dsh-system-prompt";
+import { WebRuntime, WebError } from "@deepseek-ai/dsh-web";
 
-import { googleSearchPlugin, WEB_SEARCH_TOOL_NAME } from "../src/index.js";
-import { SearchError, isSearchError } from "../src/domain/index.js";
+import {
+	googleSearchPlugin,
+	buildGoogleSearchProvider,
+	GOOGLE_SEARCH_PROVIDER_ID
+} from "../src/index.js";
 
 /**
  * Build a fresh harness context the way a real deployment would: root
- * context, the two services the plugin `inject`s, then load the plugin
+ * context, the one service the plugin `inject`s, then load the plugin
  * through the public `ctx.plugin()` contract.
+ *
+ * `pinSearchProvider` pins the seam's search-provider selection to a given
+ * id (the same field an operator sets via `$DSH_WEB_SEARCH_PROVIDER`). With
+ * the id pinned, the seam's distinct selection error codes become
+ * observable proof of registration state:
+ *   - id not registered          → `WEB_PROVIDER_CONFIGURED_MISSING`
+ *   - id registered but `available()` false
+ *                               → `WEB_PROVIDER_CONFIGURED_UNAVAILABLE`
  */
-async function loadPlugin() {
+async function loadPlugin(pinSearchProvider?: string) {
 	const ctx = new Context();
-	new SystemPrompt(ctx, {});
-	new ToolRuntime(ctx);
+	new WebRuntime(ctx, pinSearchProvider ? { searchProvider: pinSearchProvider } : {});
 	const fiber = ctx.plugin(googleSearchPlugin);
 	await fiber;
 	return { ctx, fiber };
 }
 
-/** Collect every string token in a JSON value for the neutrality scan. */
-function jsonTokens(value: unknown, out: string[] = []): string[] {
-	if (typeof value === "string") {
-		out.push(value);
-	} else if (Array.isArray(value)) {
-		for (const item of value) jsonTokens(item, out);
-	} else if (typeof value === "object" && value !== null) {
-		for (const [k, v] of Object.entries(value)) {
-			out.push(k);
-			jsonTokens(v, out);
-		}
+/** Run one seam search and resolve to the thrown `WebError`'s code. */
+async function seamSearchCode(ctx: Context): Promise<string> {
+	try {
+		await ctx.web.search({ query: "deepseek harness" });
+	} catch (err) {
+		assert.ok(err instanceof WebError, `seam search must throw a WebError, got: ${String(err)}`);
+		return err.code;
 	}
-	return out;
+	assert.fail("seam search unexpectedly resolved with an unavailable stub provider");
 }
-
-/** Google-specific wire field names that must never appear in the tool contract. */
-const GOOGLE_WIRE_FIELDS = [
-	"cx",
-	"key",
-	"num",
-	"q",
-	"safe",
-	"hl",
-	"gl",
-	"searchType",
-	"siteSearch",
-	"dateRestrict",
-	"fileType",
-	"rights"
-];
 
 test("plugin shape: object plugin with name and inject", () => {
 	assert.equal(typeof googleSearchPlugin, "object");
 	assert.equal(googleSearchPlugin.name, "google-search");
-	assert.deepEqual(googleSearchPlugin.inject, ["tools", "systemPrompt"]);
+	// The plugin requires only the `web` seam — not `tools` or `systemPrompt`,
+	// because it owns no model-facing tool (that is dsh-tool-web's job).
+	assert.deepEqual(googleSearchPlugin.inject, ["web"]);
 	assert.equal(typeof googleSearchPlugin.apply, "function");
 });
 
-test("loads through public contracts; harness discovers web_search", async () => {
-	const { ctx } = await loadPlugin();
-
-	const tool = ctx.tools.get(WEB_SEARCH_TOOL_NAME);
-	assert.notEqual(tool, undefined, "web_search must be discoverable by name");
-	assert.equal(tool!.name, WEB_SEARCH_TOOL_NAME);
-	assert.equal(typeof tool!.description, "string");
-	assert.ok(tool!.description.length > 0);
-
-	const schema = ctx.tools.schemas().find((s) => s.name === WEB_SEARCH_TOOL_NAME);
-	assert.notEqual(schema, undefined, "web_search must appear in the model-facing schema list");
+test("loads through public contracts; seam discovers the google provider", async () => {
+	const { ctx } = await loadPlugin(GOOGLE_SEARCH_PROVIDER_ID);
+	// The seam reports the provider as registered (it can find it by id) but
+	// unavailable (the stub's `available()` is false). This proves registration
+	// through the seam's own selection logic, not a private registry lookup.
+	assert.equal(
+		await seamSearchCode(ctx),
+		"WEB_PROVIDER_CONFIGURED_UNAVAILABLE"
+	);
 });
 
-test("input schema exposes no Google-specific wire fields", async () => {
-	const { ctx } = await loadPlugin();
-	const tool = ctx.tools.get(WEB_SEARCH_TOOL_NAME)!;
-
-	const parameters = tool.parameters as {
-		type: string;
-		properties: Record<string, { type: string }>;
-		required?: string[];
-	};
-	assert.equal(parameters.type, "object");
-	assert.deepEqual(Object.keys(parameters.properties).sort(), [
-		"language",
-		"limit",
-		"query",
-		"region",
-		"safeSearch"
-	]);
-
-	// Standard JSON Schema: `query` is the only required field.
-	assert.deepEqual(parameters.required, ["query"]);
-
-	// No Google wire field name anywhere in the parameter schema.
-	const tokens = jsonTokens(tool.parameters);
-	for (const field of GOOGLE_WIRE_FIELDS) {
-		assert.ok(!tokens.includes(field), `input schema must not mention Google wire field "${field}"`);
-	}
+test("without the plugin the seam reports the configured provider as missing", async () => {
+	// A context with the seam pinned to the google id but WITHOUT the plugin
+	// loaded: the seam cannot find the provider, so it reports the
+	// configured id as missing. This is the baseline the registration test
+	// contrasts against.
+	const ctx = new Context();
+	new WebRuntime(ctx, { searchProvider: GOOGLE_SEARCH_PROVIDER_ID });
+	assert.equal(await seamSearchCode(ctx), "WEB_PROVIDER_CONFIGURED_MISSING");
 });
 
-test("output schema is provider-neutral", async () => {
+test("the plugin owns no model-facing tool (provider-only)", async () => {
 	const { ctx } = await loadPlugin();
-	const tool = ctx.tools.get(WEB_SEARCH_TOOL_NAME)!;
-	const tokens = jsonTokens(tool.output.schema);
-	for (const field of GOOGLE_WIRE_FIELDS) {
-		assert.ok(!tokens.includes(field), `output schema must not mention Google wire field "${field}"`);
-	}
+	// The plugin's `inject` does not require `tools`, so a context that
+	// provides only `web` (as built above) is sufficient for it to load.
+	// There is no `tools` service here at all — so the plugin cannot have
+	// registered a tool. The `web_search` tool is owned by dsh-tool-web.
+	assert.equal(
+		(ctx as { tools?: unknown }).tools,
+		undefined,
+		"no tools service is present; the plugin must not require or create one"
+	);
 });
 
-test("execute fails with a structured capability_unavailable error (no backend wired yet)", async () => {
+test("duplicate provider id is rejected by the seam", async () => {
 	const { ctx } = await loadPlugin();
-	const tool = ctx.tools.get(WEB_SEARCH_TOOL_NAME)!;
-
-	await assert.rejects(
-		() => tool.execute({ query: "deepseek harness" }, {} as never),
+	// A second provider with the same id must be refused with a structured
+	// seam error (duplicate ids are rejected by the seam contract).
+	assert.throws(
+		() => ctx.web.registerSearchProvider(buildGoogleSearchProvider()),
 		(err: unknown) => {
-			assert.ok(isSearchError(err), "failure must be a structured SearchError, got: " + String(err));
-			const se = err as SearchError;
-			assert.equal(se.code, "capability_unavailable");
-			assert.equal(se.name, "SearchError");
-			return true;
+			assert.ok(err instanceof WebError, `expected WebError, got: ${String(err)}`);
+			return (err as WebError).code === "WEB_DUPLICATE_PROVIDER";
 		}
 	);
 });
 
-test("execute rejects semantically invalid input with a structured invalid_request error", async () => {
-	const { ctx } = await loadPlugin();
-	const tool = ctx.tools.get(WEB_SEARCH_TOOL_NAME)!;
+test("the stub provider is unavailable and fails structured (no network)", async () => {
+	const provider = buildGoogleSearchProvider();
+	assert.equal(provider.id, GOOGLE_SEARCH_PROVIDER_ID);
+	assert.equal(provider.available(), false, "stub is unavailable until the adapter is wired in (#4)");
 
-	// A whitespace-only query is structurally a valid string (passes the
-	// defineTool wrapper) but semantically invalid (fails domain validation).
+	// A direct call (bypassing the seam) must fail with a structured
+	// capability-unavailable error — never a fabricated empty success, and
+	// without performing any real Google request.
 	await assert.rejects(
-		() => tool.execute({ query: "   " }, {} as never),
+		() => provider.search({ query: "deepseek harness" }),
 		(err: unknown) => {
-			assert.ok(isSearchError(err), "failure must be a structured SearchError, got: " + String(err));
-			assert.equal((err as SearchError).code, "invalid_request");
-			return true;
+			assert.ok(err instanceof WebError, `expected WebError, got: ${String(err)}`);
+			return (err as WebError).code === "WEB_PROVIDER_UNAVAILABLE";
 		}
 	);
 });
 
-test("teardown: disposing the plugin fiber unregisters the tool", async () => {
-	const { ctx, fiber } = await loadPlugin();
-	assert.notEqual(ctx.tools.get(WEB_SEARCH_TOOL_NAME), undefined, "precondition: registered");
+test("seam auto-select reports the stub as no-usable-provider", async () => {
+	const { ctx } = await loadPlugin();
+	// No id configured: the seam auto-selects. The single registered provider
+	// is the stub (unavailable), so selection reports no usable provider.
+	assert.equal(await seamSearchCode(ctx), "WEB_PROVIDER_UNAVAILABLE");
+});
 
+test("teardown: disposing the plugin fiber unregisters the provider", async () => {
+	const { ctx, fiber } = await loadPlugin(GOOGLE_SEARCH_PROVIDER_ID);
+	// Precondition: registered (seam finds it by id, but it is unavailable).
+	assert.equal(
+		await seamSearchCode(ctx),
+		"WEB_PROVIDER_CONFIGURED_UNAVAILABLE"
+	);
+
+	// Unload the plugin's fiber: the seam's fiber-scoped disposer must
+	// unregister the provider, so the same configured id is now *missing*.
 	await fiber.dispose();
-	assert.equal(ctx.tools.get(WEB_SEARCH_TOOL_NAME), undefined, "tool must be unregistered after fiber dispose");
+	assert.equal(await seamSearchCode(ctx), "WEB_PROVIDER_CONFIGURED_MISSING");
 });
