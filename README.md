@@ -52,8 +52,9 @@ in later issues, its runtime implementation.
 | `ARCHITECTURE.md` | The stable domain vs external-provider boundary, the initial Google backend target (MVP) and its configuration shape, the Search / Fetch-Read capability split, and first-release scope + non-goals. |
 | `src/index.ts` | Plugin entry (Issue #2): registers the Google search provider on the `ctx.web` seam through public DSH/Cordis contracts. |
 | `src/provider/google.ts` | The Google search provider (Issue #2): a `WebSearchProvider` for the `ctx.web` seam. A stub for now — no real Google request until the adapter issue (#4). |
-| `src/domain/` | The provider-neutral search domain (Issue #3): `SearchQuery`/`SearchResult`/`SearchOutcome` types, `validateSearchQuery`, `normalizeSearchResults`, and the stable `SearchError` categories. |
-| `test/` | Offline tests: plugin registration/discovery/teardown and domain semantics. No network, no credentials. |
+| `src/provider/normalize.ts` | Google-response → DSH seam mapping (Issue #3): translates a parsed Google Custom Search response into the `@deepseek-ai/dsh-web` `WebSearchResult`/`WebSearchSource` types. The only place that knows Google's wire field names; optional fields stay absent and `truncated` is left to the seam. |
+| `src/provider/errors.ts` | Google-failure → `WebError` mapping (Issue #3): classifies a Google search failure into a DSH `WebError` with a machine-routable string code, reusing the DSH shared taxonomy where it exists. No closed local error taxonomy. |
+| `test/` | Offline tests: plugin registration/discovery/teardown, plus conformance of the Google-response normalization and error mapping to the DSH seam types. No network, no credentials. |
 | `package.json` / `tsconfig*.json` | ESM package + TypeScript build/test configuration (Node >= 24). |
 
 ## Development
@@ -74,21 +75,22 @@ npm test             # compile src + test, then run node --test on the compiled 
 ```
 
 The test suite is **offline**: it exercises the plugin's registration through a bare
-Cordis `Context` and the provider-neutral search domain directly. It makes **no**
-Google requests and needs **no** credentials.
+Cordis `Context` and the Google-response normalization / error-mapping helpers directly,
+asserting conformance to the DSH seam types. It makes **no** Google requests and needs
+**no** credentials.
 
 ## Status
 
 - **Issue #1** (closed): project-level contracts — this file, `ENGINEERING.md`, and
   `ARCHITECTURE.md`.
-- **Issue #2** (in progress, pending re-review): the plugin loads through public
-  DSH/Cordis contracts and registers a `WebSearchProvider` on the `ctx.web` seam
-  (`@deepseek-ai/dsh-web`). The provider is a stub for now — `available()` is
-  `false` and no real Google request is made — so the existing `web_search` tool
-  (owned by `@deepseek-ai/dsh-tool-web`) reports the capability as unavailable
-  until the real adapter lands.
-- **Issue #3** (in progress, pending review): the provider-neutral search domain —
-  validated input semantics, normalized result semantics and ordering, and stable,
-  machine-routable error categories — with offline tests.
+- **Issue #2** (approved): the plugin loads through public DSH/Cordis contracts and
+  registers a `WebSearchProvider` on the `ctx.web` seam (`@deepseek-ai/dsh-web`). The
+  provider is a stub for now — `available()` is `false` and no real Google request is
+  made — so the existing `web_search` tool (owned by `@deepseek-ai/dsh-tool-web`)
+  reports the capability as unavailable until the real adapter lands.
+- **Issue #3** (in progress, pending re-review): the Google-adapter mapping helpers —
+  Google-response → DSH seam `WebSearchResult`/`WebSearchSource` normalization and
+  Google-failure → `WebError` error mapping, using the public `@deepseek-ai/dsh-web`
+  types as the stable contract (no parallel domain) — with offline conformance tests.
 - Live Google API calls and the concrete Google adapter arrive in later issues
   (#4–#7).
