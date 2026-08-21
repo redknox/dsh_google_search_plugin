@@ -232,7 +232,9 @@ test("search() sends the documented request for a seam request", async () => {
 	assert.equal(params.get("key"), FAKE_API_KEY);
 	assert.equal(params.get("cx"), FAKE_CX);
 	assert.equal(params.get("q"), "deepseek harness");
-	assert.equal(params.has("num"), false);
+	// Issue #6: the configured maxResults default (10) is applied at the
+	// request layer as num (the API's own default, made explicit by config).
+	assert.equal(params.get("num"), "10");
 });
 
 test("search() applies maxResults at the request layer as num (clamped to 1..10)", async () => {
@@ -506,7 +508,11 @@ test("search() honors an already-aborted signal (ABORTED) without any network wo
 	const provider = configuredProvider(transport);
 
 	const err = await expectWebError(provider.search({ query: "deepseek harness" }, controller.signal), "ABORTED");
-	assert.equal(calls[0]?.signal, controller.signal, "the caller signal is forwarded to the transport");
+	// Issue #6: the transport receives a signal FUSED with the provider's
+	// requestTimeoutMs deadline (AbortSignal.any), so it is not the caller's
+	// signal object itself — but the caller's abort must propagate to it.
+	assert.equal(calls[0]?.signal?.aborted, true, "the caller's abort propagates to the transport signal");
+	assert.notEqual(calls[0]?.signal, controller.signal, "the transport signal is the fused deadline signal");
 	assert.match(err.message, /cancelled/i);
 });
 
@@ -542,7 +548,10 @@ test("search() forwards the signal: an in-flight request aborts with ABORTED", a
 	setTimeout(() => controller.abort(), 20);
 
 	const err = await expectWebError(pending, "ABORTED");
-	assert.equal(calls[0]?.signal, controller.signal);
+	// The transport signal is the fused deadline signal (see the already-
+	// aborted test above); the caller's in-flight abort must propagate to it.
+	assert.equal(calls[0]?.signal?.aborted, true, "the caller's in-flight abort propagates to the transport signal");
+	assert.notEqual(calls[0]?.signal, controller.signal, "the transport signal is the fused deadline signal");
 	assert.match(err.message, /cancelled/i);
 });
 

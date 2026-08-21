@@ -89,18 +89,24 @@ The initial Google backend target for the MVP is **Google Programmable Search �
 REST search endpoint that takes a query string and returns a list of result items with
 url, title, and snippet fields, which map onto `WebSearchSource`.
 
-**Configuration shape (contract, not values).** The adapter's runtime configuration
-requires:
+**Configuration shape (contract, not values).** The adapter is configurable
+**without editing runtime source**: it carries a declarative configuration schema
+(validated by the Harness at load) and a settings section that the provider re-reads
+on every search. The schema splits into two kinds of field:
 
 | Setting | Kind | Notes |
 |---|---|---|
-| API credential | secret, runtime-only | Supplied via environment variable(s) at runtime; **never committed**, never stored in ordinary settings (ENGINEERING.md §4). This document names the *shape* of the requirement, not a specific variable name, and never a value. |
-| Search engine id (`cx`) | non-secret, runtime-only | Required where the selected Google product requires it (Custom Search JSON API requires a `cx` identifying the Programmable Search Engine). Environment-specific ids are deployment data, **not** repository contract data: no real `cx` value is recorded here or in any checked-in default. |
+| API credential | secret, runtime-only | Resolved **per operation** from, in order: a literal secret config value, the Harness credential facilities, the launching environment, then the process environment. **Never committed**, and never stored in ordinary settings (ENGINEERING.md §4). The literal value is a `role("secret")` field stripped from every settings surface; the recommended path is an environment-backed reference (the *name* of the variable is a setting, the *value* is not). This document names the *shape* of the requirement, not a specific variable name, and never a value. |
+| Search engine id (`cx`) | non-secret, runtime-only | Required where the selected Google product requires it (Custom Search JSON API requires a `cx` identifying the Programmable Search Engine). A non-secret setting that falls back to an environment variable. Environment-specific ids are deployment data, **not** repository contract data: no real `cx` value is recorded here or in any checked-in default. |
+| Behavior settings | non-secret, have defaults | Request-shaping settings (result-limit default, language/region/safe-search, request timeout). Every field carries a user-facing description and a default that preserves the simplest usable search; they are ordinary settings (not secrets) and are persisted like any other non-secret setting. |
 
-Recorded here is the **shape** of the configuration (credential + `cx` where the
-selected Google product requires it). Real credential values and environment-specific
-ids are deployment data and must not appear in this repository's contract documents,
-config defaults, or examples.
+Recorded here is the **shape** of the configuration (a secret credential + a non-secret
+engine id + non-secret behavior settings, each with a documented resolution/default
+rule). Real credential values and environment-specific ids are deployment data and must
+not appear in this repository's contract documents, config defaults, or examples. When
+no resolution path exists for a required value, the provider reports itself
+unavailable and a search fails with a stable, actionable error that names the setting
+and the environment variable to fix — never a value.
 
 **Adapter-layer choice.** The concrete Google search product/API is an adapter-layer
 choice, not a domain decision. A future migration to, or addition of, another Google
@@ -157,17 +163,22 @@ The first release (MVP) delivers exactly:
 
 1. A DSH plugin that registers **one search provider** against `ctx.web`.
 2. A Google adapter implementing `WebSearchProvider`:
-   - `search()` calls the Google Search API with the request's `query` and honors
-     `maxResults` and `signal`;
+   - `search()` calls the Google Search API with the request's `query`, honors
+     `maxResults` and `signal`, and applies the configured behavior settings
+     (result-limit default, language/region/safe-search, request timeout);
    - maps Google results to `WebSearchSource[]` (`url`, `title?`, `snippet?`,
      `publishedAt?`), leaving absent fields `undefined`;
-   - `available()` returns a cheap local check (e.g. credential present) without
-     network access.
+   - `available()` returns a cheap synchronous check — whether a **resolution path**
+     exists for every required value (a credential source and an engine-id source) —
+     without network access; the actual per-operation resolution happens in `search()`.
 3. Runtime configuration per the shape recorded in "Initial Google backend target
-   (MVP)": an API credential and, where the selected Google product requires it, a search
-   engine id (`cx`) — both supplied at runtime, never committed, with a clear structured
-   error when missing.
-4. Tests for the mapping logic using recorded fixtures (no live network in CI).
+   (MVP)": a secret API credential (resolved per operation, never stored in ordinary
+   settings) and, where the selected Google product requires it, a non-secret search
+   engine id (`cx`) — both supplied at runtime, never committed — plus non-secret
+   behavior settings with defaults and user-facing descriptions; a clear structured
+   error naming the setting and environment variable when a value is missing.
+4. Tests for the mapping logic using recorded fixtures (no live network in CI), and
+   configuration tests covering credential isolation and validation (Issue #6).
 
 ## Non-goals (first release)
 

@@ -16,6 +16,9 @@
  *       &cx=<Programmable Search Engine id>
  *       &q=<query>
  *       [&num=<1..10>]
+ *       [&lr=<language restriction, e.g. lang_ja>]
+ *       [&gl=<two-letter country code, e.g. US>]
+ *       [&safe=<off|active>]
  *
  * The API key travels as a query parameter because the API authenticates
  * that way; it is therefore **never** included in any error message or log
@@ -76,14 +79,32 @@ export interface GoogleSearchRequestOptions {
 	 * 1..10 range. Omitted = Google's default (10).
 	 */
 	readonly num?: number;
+	/**
+	 * Language restriction (query parameter `lr`, e.g. `lang_ja`). Omitted or
+	 * blank = no restriction (Google's default).
+	 */
+	readonly language?: string;
+	/**
+	 * Region boost (query parameter `gl`, a two-letter country code, e.g.
+	 * `US`). Omitted or blank = no boost (Google's default).
+	 */
+	readonly region?: string;
+	/**
+	 * SafeSearch filtering (query parameter `safe`): `"active"` enables
+	 * filtering, `"off"` disables it (Google's default). Omitted = Google's
+	 * default.
+	 */
+	readonly safe?: "off" | "active";
 }
 
 /**
  * Serialize one Google search into its request URL.
  *
- * Parameter order is fixed (`key`, `cx`, `q`, `num`) so the output is
- * deterministic and fixture-stable. Values are percent-encoded by
- * `URLSearchParams`; the query is sent as-is (Google interprets it).
+ * Parameter order is fixed (`key`, `cx`, `q`, `num`, `lr`, `gl`, `safe`) so
+ * the output is deterministic and fixture-stable. Values are percent-encoded
+ * by `URLSearchParams`; the query is sent as-is (Google interprets it).
+ * Blank `language`/`region` values are omitted (they mean "no restriction",
+ * which is also Google's default — sending them would be noise).
  *
  * @throws {RangeError} when `num` is not an integer within 1..10 — a
  *   programming error, surfaced loudly rather than silently clamped.
@@ -100,6 +121,15 @@ export function buildGoogleSearchUrl(options: GoogleSearchRequestOptions): strin
 			);
 		}
 		params.set("num", String(options.num));
+	}
+	if (options.language !== undefined && options.language.trim().length > 0) {
+		params.set("lr", options.language);
+	}
+	if (options.region !== undefined && options.region.trim().length > 0) {
+		params.set("gl", options.region);
+	}
+	if (options.safe !== undefined) {
+		params.set("safe", options.safe);
 	}
 	return `${GOOGLE_SEARCH_ENDPOINT}?${params.toString()}`;
 }
@@ -266,17 +296,19 @@ export function describeGoogleHttpError(status: number, body: string): string {
  * Classify a transport-level failure (the fetch itself threw) given the
  * caller's signal: an aborted signal means the caller cancelled — *timeout*
  * when the abort reason is a `TimeoutError` (as produced by
- * `AbortSignal.timeout`), *aborted* otherwise. A non-aborted failure is a
- * *timeout* when the thrown error is a `TimeoutError`, an *aborted* when it
- * is an `AbortError`, and a *provider_failure* for everything else
- * (connection refused, DNS, TLS, …).
+ * `AbortSignal.timeout`) or a `TimeoutReason` (as produced by the
+ * `deadline()` helper in `@deepseek-ai/dsh-timeout`, which the provider uses
+ * for its `requestTimeoutMs` setting), *aborted* otherwise. A non-aborted
+ * failure is a *timeout* when the thrown error is a `TimeoutError` or
+ * `TimeoutReason`, an *aborted* when it is an `AbortError`, and a
+ * *provider_failure* for everything else (connection refused, DNS, TLS, …).
  */
 export function classifyGoogleFetchError(err: unknown, signal: AbortSignal | undefined): GoogleSearchFailureClass {
 	if (signal?.aborted) {
-		return nameOf(signal.reason) === "TimeoutError" ? "timeout" : "aborted";
+		return isTimeoutName(nameOf(signal.reason)) ? "timeout" : "aborted";
 	}
 	const name = nameOf(err);
-	if (name === "TimeoutError") {
+	if (isTimeoutName(name)) {
 		return "timeout";
 	}
 	if (name === "AbortError") {
@@ -285,21 +317,28 @@ export function classifyGoogleFetchError(err: unknown, signal: AbortSignal | und
 	return "provider_failure";
 }
 
+/** True for the abort-reason/error names that denote a timeout. */
+function isTimeoutName(name: string | undefined): boolean {
+	return name === "TimeoutError" || name === "TimeoutReason";
+}
+
 /**
- * Perform one Google search end to end: resolve configuration, serialize the
- * request, perform the transport call, classify failures, and normalize a
- * successful response onto the seam result shape.
+ * Perform one Google search end to end: serialize the request, perform the
+ * transport call, classify failures, and normalize a successful response onto
+ * the seam result shape.
  *
  * Every failure path throws a structured {@link WebError} (via
  * {@link mapGoogleSearchFailure}) — never a success-shaped result
  * (ENGINEERING.md §7):
  *
- *   - missing configuration        → `MISSING_CREDENTIAL`
  *   - transport throw              → `ABORTED` / `TIMEOUT` / `PROVIDER_FAILURE`
  *   - non-2xx response             → per {@link classifyGoogleHttpError}
  *   - unparseable / unmappable 2xx → `MALFORMED_RESPONSE`
  *
- * @param options - credential + query + optional `num` (see above).
+ * (The `MISSING_CREDENTIAL` path is owned by the provider, which resolves
+ * configuration per operation before calling this.)
+ *
+ * @param options - credential + query + optional `num`/`lr`/`gl`/`safe` (see above).
  * @param transport - the HTTP transport (injectable for tests).
  * @param signal - the caller's cancellation signal, forwarded to the transport.
  */
