@@ -50,9 +50,51 @@ in later issues, its runtime implementation.
 | `README.md` | Product positioning — what the plugin is and is not (this file). |
 | `ENGINEERING.md` | Normative engineering principles for human and AI contributors. |
 | `ARCHITECTURE.md` | The stable domain vs external-provider boundary, the initial Google backend target (MVP) and its configuration shape, the Search / Fetch-Read capability split, and first-release scope + non-goals. |
+| `src/index.ts` | Plugin entry (Issue #2): registers the `web_search` tool and its guidance section through public DSH/Cordis contracts. |
+| `src/tool/web-search.ts` | The model-facing `web_search` tool definition (Issue #2): provider-neutral input/output, structured `capability_unavailable` failure until a backend is wired. |
+| `src/domain/` | The provider-neutral search domain (Issue #3): `SearchQuery`/`SearchResult`/`SearchOutcome` types, `validateSearchQuery`, `normalizeSearchResults`, and the stable `SearchError` categories. |
+| `test/` | Offline tests: plugin registration/discovery/teardown and domain semantics. No network, no credentials. |
+| `package.json` / `tsconfig*.json` | ESM package + TypeScript build/test configuration (Node >= 24). |
+
+## Development
+
+Node.js **>= 24** is required.
+
+```sh
+npm install          # install dependencies (no network needed at test time)
+npm run check        # typecheck + build + run the full test suite
+```
+
+Individual steps:
+
+```sh
+npm run typecheck    # tsc --noEmit over src + test
+npm run build        # compile src/ -> lib/ (package output)
+npm test             # compile src + test, then run node --test on the compiled JS
+```
+
+The test suite is **offline**: it exercises the plugin's registration through a bare
+Cordis `Context` and the provider-neutral search domain directly. It makes **no**
+Google requests and needs **no** credentials.
 
 ## Status
 
-Issue #1 establishes the project-level contracts (this file, `ENGINEERING.md`, and
-`ARCHITECTURE.md`). Runtime implementation and live Google API calls are explicitly
-**out of scope** for this issue and arrive in later issues.
+- **Issue #1** (closed): project-level contracts — this file, `ENGINEERING.md`, and
+  `ARCHITECTURE.md`.
+- **Issue #2** (in progress, pending review): the plugin loads through public
+  DSH/Cordis contracts and registers a discoverable `web_search` tool with a
+  provider-neutral input and output contract. No search backend is wired in yet, so
+  a call fails with a structured `capability_unavailable` error.
+- **Issue #3** (in progress, pending review): the provider-neutral search domain —
+  validated input semantics, normalized result semantics and ordering, and stable,
+  machine-routable error categories — with offline tests.
+- Live Google API calls and the concrete Google adapter arrive in later issues
+  (#4–#7).
+
+> **Architecture note (pending revision).** This implementation follows Issue #2
+> literally: the plugin **registers its own `web_search` tool** via
+> `@deepseek-ai/dsh-tools` `defineTool`. That conflicts with the
+> "Not a new model-facing tool" / provider-only wording in this file and in
+> `ARCHITECTURE.md`, which were written for the earlier `ctx.web` provider design.
+> The maintainer chose the self-registering-tool path for this round; these docs
+> need a post-review revision to match. Flagged here and in the commit message.
