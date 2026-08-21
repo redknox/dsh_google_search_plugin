@@ -8,12 +8,18 @@
  * plugin-owned tool (the `web_search` tool is owned by
  * `@deepseek-ai/dsh-tool-web`).
  *
- * No network, no Google, no credentials — a bare Cordis `Context` with the
- * one required service (`web`), exactly as the public contracts allow.
+ * No network, no Google, no credentials: the tests run with the Google
+ * runtime-configuration environment variables **removed** (restored
+ * afterwards), so the provider is deterministically in its *unconfigured*
+ * state — registered, but `available()` false — exactly the state the seam
+ * reports as `WEB_PROVIDER_CONFIGURED_UNAVAILABLE`. The configured/available
+ * path (and the real adapter behavior) is covered by `google.test.ts` with
+ * an injected env source and a mock transport.
  */
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import { after } from "node:test";
 
 import { Context } from "@deepseek-ai/cordis";
 import { WebRuntime, WebError } from "@deepseek-ai/dsh-web";
@@ -23,6 +29,29 @@ import {
 	buildGoogleSearchProvider,
 	GOOGLE_SEARCH_PROVIDER_ID
 } from "../src/index.js";
+import { GOOGLE_SEARCH_API_KEY_ENV, GOOGLE_SEARCH_ENGINE_ID_ENV } from "../src/provider/config.js";
+
+/**
+ * Make the process environment hermetic for the duration of this file:
+ * remove the Google runtime-configuration variables (saving any values the
+ * developer's shell happened to set) so the plugin's provider is
+ * deterministically *unconfigured*. Restored after the file finishes.
+ */
+const CONFIG_ENV_KEYS = [GOOGLE_SEARCH_API_KEY_ENV, GOOGLE_SEARCH_ENGINE_ID_ENV] as const;
+const savedEnv: Record<string, string | undefined> = {};
+for (const key of CONFIG_ENV_KEYS) {
+	savedEnv[key] = process.env[key];
+	delete process.env[key];
+}
+after(() => {
+	for (const key of CONFIG_ENV_KEYS) {
+		if (savedEnv[key] === undefined) {
+			delete process.env[key];
+		} else {
+			process.env[key] = savedEnv[key];
+		}
+	}
+});
 
 /**
  * Build a fresh harness context the way a real deployment would: root
@@ -53,7 +82,7 @@ async function seamSearchCode(ctx: Context): Promise<string> {
 		assert.ok(err instanceof WebError, `seam search must throw a WebError, got: ${String(err)}`);
 		return err.code;
 	}
-	assert.fail("seam search unexpectedly resolved with an unavailable stub provider");
+	assert.fail("seam search unexpectedly resolved with an unconfigured provider");
 }
 
 test("plugin shape: object plugin with name and inject", () => {
@@ -68,7 +97,8 @@ test("plugin shape: object plugin with name and inject", () => {
 test("loads through public contracts; seam discovers the google provider", async () => {
 	const { ctx } = await loadPlugin(GOOGLE_SEARCH_PROVIDER_ID);
 	// The seam reports the provider as registered (it can find it by id) but
-	// unavailable (the stub's `available()` is false). This proves registration
+	// unavailable (the runtime configuration is absent in this hermetic
+	// environment, so `available()` is false). This proves registration
 	// through the seam's own selection logic, not a private registry lookup.
 	assert.equal(
 		await seamSearchCode(ctx),
@@ -104,7 +134,7 @@ test("duplicate provider id is rejected by the seam", async () => {
 	// A second provider with the same id must be refused with a structured
 	// seam error (duplicate ids are rejected by the seam contract).
 	assert.throws(
-		() => ctx.web.registerSearchProvider(buildGoogleSearchProvider()),
+		() => ctx.web.registerSearchProvider(buildGoogleSearchProvider({ env: {} })),
 		(err: unknown) => {
 			assert.ok(err instanceof WebError, `expected WebError, got: ${String(err)}`);
 			return (err as WebError).code === "WEB_DUPLICATE_PROVIDER";
@@ -112,27 +142,31 @@ test("duplicate provider id is rejected by the seam", async () => {
 	);
 });
 
-test("the stub provider is unavailable and fails structured (no network)", async () => {
-	const provider = buildGoogleSearchProvider();
+test("the unconfigured provider is unavailable and fails structured (no network)", async () => {
+	const provider = buildGoogleSearchProvider({ env: {} });
 	assert.equal(provider.id, GOOGLE_SEARCH_PROVIDER_ID);
-	assert.equal(provider.available(), false, "stub is unavailable until the adapter is wired in (#4)");
+	assert.equal(provider.available(), false, "provider is unavailable while the runtime configuration is absent");
 
 	// A direct call (bypassing the seam) must fail with a structured
-	// capability-unavailable error — never a fabricated empty success, and
-	// without performing any real Google request.
+	// capability-unavailable error naming the missing variables — never a
+	// fabricated empty success, and without performing any Google request.
 	await assert.rejects(
 		() => provider.search({ query: "deepseek harness" }),
 		(err: unknown) => {
 			assert.ok(err instanceof WebError, `expected WebError, got: ${String(err)}`);
-			return (err as WebError).code === "WEB_PROVIDER_UNAVAILABLE";
+			const webError = err as WebError;
+			assert.equal(webError.code, "MISSING_CREDENTIAL");
+			assert.match(webError.message, /GOOGLE_SEARCH_API_KEY/);
+			assert.match(webError.message, /GOOGLE_SEARCH_ENGINE_ID/);
+			return true;
 		}
 	);
 });
 
-test("seam auto-select reports the stub as no-usable-provider", async () => {
+test("seam auto-select reports the unconfigured provider as no-usable-provider", async () => {
 	const { ctx } = await loadPlugin();
 	// No id configured: the seam auto-selects. The single registered provider
-	// is the stub (unavailable), so selection reports no usable provider.
+	// is unconfigured (unavailable), so selection reports no usable provider.
 	assert.equal(await seamSearchCode(ctx), "WEB_PROVIDER_UNAVAILABLE");
 });
 

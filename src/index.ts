@@ -11,6 +11,12 @@
  * `@deepseek-ai/dsh-tool-web`; this plugin only supplies a search backend
  * to that existing tool (ARCHITECTURE.md).
  *
+ * The provider's runtime configuration (API credential + search engine id)
+ * is resolved from environment variables at load time (Issue #4,
+ * ENGINEERING.md §4); when it is incomplete the provider registers but
+ * reports `available()` false, so the seam keeps reporting the capability
+ * as unavailable until the runtime configuration is supplied.
+ *
  * Lifecycle: `ctx.web.registerSearchProvider` returns a disposer that is
  * disposed with the calling fiber, so Cordis unregisters the provider
  * automatically when the plugin's fiber unloads — no manual teardown.
