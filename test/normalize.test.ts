@@ -15,6 +15,9 @@
  *  - unknown/missing stays unknown/absent (blank optionals are dropped, not
  *    defaulted; `publishedAt` is never synthesized);
  *  - order is preserved;
+ *  - absent is not malformed: an object response without an `items` field
+ *    (Google omits it when there are no results) is a valid zero-result
+ *    success, while a *present* non-array `items` is `MALFORMED_RESPONSE`;
  *  - a malformed response is a `WebError`, never a success-shaped result.
  */
 
@@ -168,6 +171,22 @@ test("normalize: an empty items array is a legitimate no-results success", () =>
 	assert.equal(result.truncated, false);
 });
 
+test("normalize: an object response without an items field is a valid zero-result success", () => {
+	// Google omits the optional `items` field entirely when there are no
+	// results — absent is a fact (no results), not a malformed concrete
+	// value (ENGINEERING.md §2).
+	for (const body of [
+		{},
+		{ kind: "customsearch#search" },
+		{ kind: "customsearch#search", searchInformation: { totalResults: "0" } }
+	]) {
+		const result: WebSearchResult = normalizeGoogleSearchResponse(body);
+		assertSeamResultShape(result);
+		assert.deepEqual(result.sources, [], `body=${JSON.stringify(body)} must yield zero sources`);
+		assert.equal(result.truncated, false);
+	}
+});
+
 test("normalize: an item without a usable link is dropped (not an error)", () => {
 	const result: WebSearchResult = normalizeGoogleSearchResponse({
 		items: [
@@ -203,8 +222,10 @@ test("normalize: a non-object body is MALFORMED_RESPONSE", () => {
 	}
 });
 
-test("normalize: a body without an items array is MALFORMED_RESPONSE", () => {
-	for (const body of [{}, { items: null }, { items: "nope" }, { search: { items: [] } }]) {
+test("normalize: a present items field with a non-array value is MALFORMED_RESPONSE", () => {
+	// Present-but-wrong-typed is malformed; *absent* is a zero-result
+	// success (covered above). The distinction must not collapse.
+	for (const body of [{ items: null }, { items: "nope" }, { items: 42 }, { items: { link: "https://example.com" } }]) {
 		assert.throws(
 			() => normalizeGoogleSearchResponse(body),
 			(err: unknown) =>
@@ -226,9 +247,10 @@ test("normalize: items present but none usable is MALFORMED_RESPONSE (not an emp
 });
 
 test("normalize: the thrown error is a WebError with a machine-routable string code", () => {
-	// A body with no `items` array at all is malformed, so the helper throws.
+	// A present `items` field with a non-array value is malformed, so the
+	// helper throws.
 	assert.throws(
-		() => normalizeGoogleSearchResponse({ bad: true }),
+		() => normalizeGoogleSearchResponse({ items: "nope" }),
 		(err: unknown) => {
 			assert.ok(err instanceof WebError, "must be a WebError");
 			assert.equal(typeof err.code, "string");

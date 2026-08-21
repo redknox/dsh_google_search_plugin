@@ -30,6 +30,13 @@
  * response*, not a silent success: it throws a `WebError` with the
  * `MALFORMED_RESPONSE` code (see {@link ./errors.js}). Per ENGINEERING.md §7
  * a failure is never hidden behind a success-shaped result.
+ *
+ * **Absent is not malformed** (ENGINEERING.md §2): Google omits the optional
+ * `items` field entirely when there are no results, so a valid object
+ * response *without* `items` is a legitimate zero-result success. Only an
+ * `items` field that is *present* with a non-array value is malformed —
+ * the distinction between *absent* and *malformed concrete value* is
+ * preserved, not collapsed.
  */
 
 import { WebError, type WebSearchResult, type WebSearchSource } from "@deepseek-ai/dsh-web";
@@ -43,21 +50,27 @@ import { GOOGLE_SEARCH_ERROR_CODES } from "./errors.js";
  *   Error bodies (rate limit, auth, 5xx) are classified by the transport layer
  *   before this helper is reached and are not malformed responses.
  * @returns a `WebSearchResult` whose `sources` preserve Google's result order,
- *   with `truncated: false` (the seam owns truncation) and no `content`.
+ *   with `truncated: false` (the seam owns truncation) and no `content`. An
+ *   object response whose `items` field is absent (Google omits it when there
+ *   are no results) or empty is a legitimate zero-result success.
  * @throws {WebError} with code `MALFORMED_RESPONSE` when the body is not an
- *   object, has no `items` array, or its items contain no usable result.
+ *   object, when `items` is present with a non-array value, or when `items`
+ *   is present and non-empty but contains no usable result.
  */
 export function normalizeGoogleSearchResponse(body: unknown): WebSearchResult {
 	if (!isPlainObject(body)) {
 		throw malformed("response body must be a JSON object");
 	}
 	const items = body["items"];
-	if (!Array.isArray(items)) {
-		throw malformed("response body must contain an 'items' array");
+	// Absent `items` is a valid zero-result response (Google omits the field
+	// when there are no results); present-but-not-an-array is malformed.
+	if (items !== undefined && !Array.isArray(items)) {
+		throw malformed("response 'items' must be an array when present");
 	}
 
+	const entries = items === undefined ? [] : items;
 	const sources: WebSearchSource[] = [];
-	for (const item of items) {
+	for (const item of entries) {
 		const source = normalizeGoogleItem(item);
 		if (source !== undefined) {
 			sources.push(source);
@@ -65,9 +78,9 @@ export function normalizeGoogleSearchResponse(body: unknown): WebSearchResult {
 	}
 
 	// A response that carried items but none of them usable is malformed —
-	// we expected at least one source and got none. An *empty* `items` array
-	// is a legitimate "no results" success and yields zero sources.
-	if (items.length > 0 && sources.length === 0) {
+	// we expected at least one source and got none. An *absent* or *empty*
+	// `items` is a legitimate "no results" success and yields zero sources.
+	if (entries.length > 0 && sources.length === 0) {
 		throw malformed("response 'items' contained no usable search result");
 	}
 

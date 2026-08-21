@@ -39,6 +39,14 @@
  * by the caller from the thrown error and the forwarded signal: an aborted
  * caller signal is *aborted* (or *timeout* when the abort reason is a
  * `TimeoutError`), anything else is *provider_failure*.
+ *
+ * **Cause-chain credential safety.** Because the request URL carries the API
+ * credential as a query parameter, the raw thrown transport error is never
+ * chained as `WebError.cause`: a production transport (or a proxy in front
+ * of it) may embed the full request URL in its error text, and the cause is
+ * exactly what log serializers walk. Instead, a sanitized stand-in — the
+ * failure's `name`/`code` plus a bounded message with URL tokens scrubbed —
+ * is chained (see {@link sanitizeTransportCause}).
  */
 
 import type { WebSearchResult } from "@deepseek-ai/dsh-web";
@@ -313,7 +321,9 @@ export async function performGoogleSearch(
 				: failureClass === "timeout"
 					? "google search request timed out"
 					: `google search request failed: ${describeThrownError(err)}`;
-		throw mapGoogleSearchFailure(failureClass, message, err);
+		// Chain the credential-safe stand-in, never the raw transport error
+		// (see the module doc — the request URL carries the credential).
+		throw mapGoogleSearchFailure(failureClass, message, sanitizeTransportCause(err));
 	}
 
 	if (response.status < 200 || response.status >= 300) {
@@ -334,6 +344,53 @@ export async function performGoogleSearch(
 	return normalizeGoogleSearchResponse(parsed);
 }
 
+/**
+ * Build the credential-safe stand-in chained as `WebError.cause` for a
+ * transport-level failure.
+ *
+ * The raw thrown error is deliberately **not** chained: the request URL
+ * carries the API credential as a query parameter, and a production
+ * transport (or a proxy in front of it) may embed the full request URL in
+ * its error text — the cause is exactly what log serializers walk. The
+ * stand-in preserves only what is safe and useful for diagnosis:
+ *
+ *   - the failure's `name` (for example `TimeoutError`, `AbortError`) and
+ *     its `code` (for example `ECONNREFUSED`, `ENOTFOUND`);
+ *   - a bounded, single-line `message` with URL tokens scrubbed: any
+ *     `http(s)://…` token and any `key=…`/`cx=…` query fragment is replaced
+ *     by a redaction marker, so a URL embedded in the message cannot
+ *     survive into the cause chain.
+ *
+ * The stand-in is a plain `Error` (no custom class), so consumers that
+ * inspect `cause` see a standard error shape.
+ */
+export function sanitizeTransportCause(err: unknown): Error {
+	const name = nameOf(err) ?? "Error";
+	const raw = err instanceof Error ? err.message : String(err);
+	const cause = new Error(truncate(scrubUrlTokens(raw.replace(/\s+/g, " ").trim()), 300) || "transport error");
+	cause.name = name;
+	if (typeof err === "object" && err !== null) {
+		const code = (err as { code?: unknown }).code;
+		if (typeof code === "string" && code.length > 0) {
+			(cause as { code?: string }).code = code;
+		}
+	}
+	return cause;
+}
+
+/**
+ * Scrub URL tokens from text: replace any `http(s)://…` token (up to the
+ * first whitespace or quote) and any `key=…` / `cx=…` query fragment with a
+ * redaction marker, so a credential-bearing URL cannot survive into an
+ * error message or a cause chain.
+ */
+export function scrubUrlTokens(text: string): string {
+	return text
+		.replace(/https?:\/\/[^\s"'<>]+/gi, "[url redacted]")
+		.replace(/\bkey=[^\s&"'<>]+/gi, "key=[redacted]")
+		.replace(/\bcx=[^\s&"'<>]+/gi, "cx=[redacted]");
+}
+
 /** The `name` of a thrown value, when it carries one. */
 function nameOf(value: unknown): string | undefined {
 	if (typeof value === "object" && value !== null) {
@@ -345,10 +402,10 @@ function nameOf(value: unknown): string | undefined {
 	return undefined;
 }
 
-/** A bounded, single-line description of a thrown transport error. */
+/** A bounded, single-line, credential-safe description of a thrown transport error. */
 function describeThrownError(err: unknown): string {
 	const message = err instanceof Error ? err.message : String(err);
-	return truncate(message.replace(/\s+/g, " ").trim(), 300) || "unknown transport error";
+	return truncate(scrubUrlTokens(message.replace(/\s+/g, " ").trim()), 300) || "unknown transport error";
 }
 
 /** Truncate text to `max` characters, marking the cut. */

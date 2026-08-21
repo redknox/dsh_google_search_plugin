@@ -15,11 +15,15 @@
  *   2. normalization          — Google results normalize onto the provider-
  *      neutral seam types without leaking wire DTOs (`link` etc. stay in the
  *      adapter);
- *   3. empty results          — `items: []` is a valid zero-source result;
+ *   3. empty results          — `items: []` AND a response that omits
+ *      `items` entirely (Google's real zero-result wire shape) are valid
+ *      zero-source results; a *present* non-array `items` is malformed;
  *   4. stable failure paths   — auth/config, quota/rate-limit,
  *      timeout/cancel, provider error, and malformed response each have a
  *      stable, structured `WebError` code;
- *   5./6. no live credential  — mocks + fake fixture values only.
+ *   5./6. no live credential  — mocks + fake fixture values only; the
+ *      transport-error cause chain is credential-safe (URL tokens scrubbed,
+ *      raw transport error never chained).
  */
 
 import test from "node:test";
@@ -45,6 +49,8 @@ import {
 	classifyGoogleHttpError,
 	googleNumForMaxResults,
 	parseGoogleErrorDetail,
+	sanitizeTransportCause,
+	scrubUrlTokens,
 	type GoogleHttpTransport,
 	type GoogleHttpResponse
 } from "../src/provider/transport.js";
@@ -286,6 +292,30 @@ test("an empty items array is a valid zero-source result, not an error", async (
 	assert.equal(result.truncated, false);
 });
 
+test("a 200 response that omits the items field entirely is a valid zero-source result (review case)", async () => {
+	// Google omits the optional `items` field when there are no results —
+	// absent is a fact (no results), not a malformed concrete value.
+	const { transport } = makeTransport(() => ({
+		status: 200,
+		body: JSON.stringify({
+			kind: "customsearch#search",
+			queries: { request: [{ title: "Google Search", totalResults: "0", searchTerms: "zzz" }] },
+			searchInformation: { totalResults: "0" }
+		})
+	}));
+	const provider = configuredProvider(transport);
+
+	const result = await provider.search({ query: "zzz no results" });
+	assert.equal(result.sources.length, 0);
+	assert.equal(result.truncated, false);
+});
+
+test("a 200 response with a present non-array items field is MALFORMED_RESPONSE (review case)", async () => {
+	const { transport } = makeTransport(() => ({ status: 200, body: JSON.stringify({ items: "invalid" }) }));
+	const provider = configuredProvider(transport);
+	await expectWebError(provider.search({ query: "deepseek harness" }), "MALFORMED_RESPONSE");
+});
+
 // ---------------------------------------------------------------------------
 // Failure paths (acceptance 4)
 // ---------------------------------------------------------------------------
@@ -390,8 +420,8 @@ test("search() maps a 2xx body that is not JSON to MALFORMED_RESPONSE", async ()
 	await expectWebError(provider.search({ query: "deepseek harness" }), "MALFORMED_RESPONSE");
 });
 
-test("search() maps a 2xx body without a usable items array to MALFORMED_RESPONSE", async () => {
-	const { transport } = makeTransport(() => ({ status: 200, body: JSON.stringify({ kind: "customsearch#search" }) }));
+test("search() maps a 2xx body with a present non-array items field to MALFORMED_RESPONSE", async () => {
+	const { transport } = makeTransport(() => ({ status: 200, body: JSON.stringify({ kind: "customsearch#search", items: 42 }) }));
 	const provider = configuredProvider(transport);
 	await expectWebError(provider.search({ query: "deepseek harness" }), "MALFORMED_RESPONSE");
 });
@@ -416,7 +446,7 @@ test("classifyGoogleFetchError: aborted signal wins; otherwise the thrown error 
 	assert.equal(classifyGoogleFetchError(new Error("fetch failed"), undefined), "provider_failure");
 });
 
-test("search() maps a transport throw to a structured WebError with the cause chained", async () => {
+test("search() maps a transport throw to a structured WebError with a credential-safe cause", async () => {
 	const boom = new Error("fetch failed");
 	const { transport } = makeTransport(() => {
 		throw boom;
@@ -424,7 +454,44 @@ test("search() maps a transport throw to a structured WebError with the cause ch
 	const provider = configuredProvider(transport);
 
 	const err = await expectWebError(provider.search({ query: "deepseek harness" }), "PROVIDER_FAILURE");
-	assert.equal((err as Error).cause, boom, "the underlying transport error is chained as cause");
+	const cause = (err as Error).cause;
+	assert.ok(cause instanceof Error, "a cause is chained (for diagnosis)");
+	assert.notEqual(cause, boom, "the raw transport error is NOT chained — it may embed the request URL");
+	assert.equal(cause.message, "fetch failed", "the safe parts of the failure survive");
+	assert.equal(cause.name, "Error");
+});
+
+test("sanitizeTransportCause: a URL-embedding transport error is redacted in the cause", () => {
+	// A production transport (or a proxy) may embed the full request URL —
+	// credential included — in its error text. The chained cause must not
+	// carry it.
+	const raw = new TypeError(
+		`fetch failed: GET https://customsearch.googleapis.com/customsearch/v1?key=${FAKE_API_KEY}&cx=${FAKE_CX}&q=deepseek`
+	);
+	raw.name = "TypeError";
+
+	const cause = sanitizeTransportCause(raw);
+	assert.equal(cause.name, "TypeError");
+	assert.ok(!cause.message.includes(FAKE_API_KEY), "the credential must not survive into the cause");
+	assert.ok(!cause.message.includes(FAKE_CX), "the cx value must not survive into the cause");
+	assert.match(cause.message, /fetch failed/, "the non-credential part of the message survives");
+	assert.match(cause.message, /\[url redacted\]/, "the URL is replaced by a redaction marker");
+});
+
+test("sanitizeTransportCause: preserves name and code of the underlying failure", () => {
+	const raw = Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:59999"), { code: "ECONNREFUSED" });
+	const cause = sanitizeTransportCause(raw);
+	assert.equal(cause.message, "connect ECONNREFUSED 127.0.0.1:59999");
+	assert.equal((cause as { code?: string }).code, "ECONNREFUSED", "the machine-routable code survives");
+});
+
+test("scrubUrlTokens: redacts URL tokens and key=/cx= query fragments", () => {
+	assert.equal(scrubUrlTokens("ok"), "ok");
+	assert.equal(
+		scrubUrlTokens(`GET https://customsearch.googleapis.com/customsearch/v1?key=${FAKE_API_KEY}&cx=${FAKE_CX} failed`),
+		"GET [url redacted] failed"
+	);
+	assert.equal(scrubUrlTokens(`retry key=${FAKE_API_KEY} then cx=${FAKE_CX}`), "retry key=[redacted] then cx=[redacted]");
 });
 
 test("search() honors an already-aborted signal (ABORTED) without any network work", async () => {
