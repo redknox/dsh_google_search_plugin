@@ -56,7 +56,7 @@ in later issues, its runtime implementation.
 | `src/provider/transport.ts` | Google provider edge (Issue #4): request URL serialization (endpoint + `key`/`cx`/`q`/`num`), the fetch transport (injectable for tests), status/reason-based error classification, and a credential-safe cause chain (the raw transport error is never chained — URL tokens are scrubbed because the request URL carries the API key). The only place that knows the Google endpoint and parameter set. |
 | `src/provider/normalize.ts` | Google-response → DSH seam mapping (Issues #3, #4): translates a parsed Google Custom Search response into the `@deepseek-ai/dsh-web` `WebSearchResult`/`WebSearchSource` types. The only place that knows Google's wire field names; optional fields stay absent, an *absent* `items` field (Google's real zero-result wire shape) is a valid empty result, and `truncated` is left to the seam. |
 | `src/provider/errors.ts` | Google-failure → `WebError` mapping (Issue #3): classifies a Google search failure into a DSH `WebError` with a machine-routable string code, reusing the DSH shared taxonomy where it exists. No closed local error taxonomy. |
-| `test/` | Offline tests: plugin registration/discovery/teardown, conformance of the normalization and error mapping to the DSH seam types, and the full adapter (request serialization, normalization, empty results, and every failure path) against injected mock transports and fixture values. No network, no live credentials. |
+| `test/` | Offline tests: plugin registration/discovery/teardown, conformance of the normalization and error mapping to the DSH seam types, the full adapter (request serialization, normalization, empty results, and every failure path), and end-to-end tool wiring (Issue #5): the real `web_search` tool (`@deepseek-ai/dsh-tool-web`), registry, seam, and cooperative-timeout policy composed with the real Google provider, driven through `ctx.tools.execute` against injected mock transports and fixture values. No network, no live credentials. |
 | `package.json` / `tsconfig*.json` | ESM package + TypeScript build/test configuration (Node >= 24). |
 
 ## Development
@@ -107,12 +107,19 @@ unavailable), and a direct `search()` call fails with a structured
   DSH seam `WebSearchResult`/`WebSearchSource` normalization and Google-failure →
   `WebError` error mapping, using the public `@deepseek-ai/dsh-web` types as the
   stable contract (no parallel domain) — with offline conformance tests.
-- **Issue #4** (in progress, pending review): the real Google search backend adapter —
+- **Issue #4** (approved): the real Google search backend adapter —
   request serialization against the documented Custom Search JSON API, response
   normalization, stable failure mapping (auth/config, quota/rate-limit,
   timeout/cancel, provider error, malformed response), runtime configuration from
   environment variables, and offline tests with mock transports. The existing
   `web_search` tool (owned by `@deepseek-ai/dsh-tool-web`) reports the capability
   as available once the runtime configuration is supplied.
+- **Issue #5** (in progress, pending review): the Google backend wired into the
+  Harness tool contract — end-to-end tests that compose the **real** `web_search`
+  tool (`@deepseek-ai/dsh-tool-web`), the tool registry, the `ctx.web` seam, and
+  the cooperative-timeout policy with the real Google provider, and drive the tool
+  through `ctx.tools.execute` (success, `maxResults` bound, multi-query merge,
+  empty results, invalid input, provider failures, cancellation, and timeout). The
+  plugin stays provider-only; the tool contract remains Google-neutral.
 - Live end-to-end verification against the real Google API arrives in a later
   issue (#7); until then the wording stays *planned*, not *validated*.
