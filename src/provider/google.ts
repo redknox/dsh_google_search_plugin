@@ -13,15 +13,18 @@
  * wire format stays inside this adapter layer and never leaks into the seam
  * (ENGINEERING.md §1).
  *
- * Configuration (Issue #6): the provider is built from the plugin's
- * {@link Config} section (see `./config.ts`). **Credentials are resolved per
- * operation** — a literal `apiKey` (a `role("secret")` field, never
- * persisted), then the Harness credential facilities, then the launching
- * environment, then the process environment — and are never cached on the
- * provider or stored in ordinary settings (ENGINEERING.md §4). Behavior
- * settings (result limit, language, region, SafeSearch, request timeout)
- * come from the same section and may be changed at runtime through the
- * `google-search` settings section without editing source.
+ * Configuration (Issue #6): the provider is built from the plugin's persisted
+ * settings section (the {@link Settings} schema, see `./config.ts`) plus the
+ * literal `apiKey` from the plugin composition input. **Credentials are
+ * resolved per operation** — the literal composition key (a `role("secret")`
+ * value that is never persisted), then the Harness credential facilities,
+ * then the launching environment, then the process environment — and are
+ * never cached on the provider or stored in ordinary settings
+ * (ENGINEERING.md §4). Behavior settings (result limit, language, region,
+ * SafeSearch, request timeout) come from the settings section and may be
+ * changed at runtime through the `google-search` settings section without
+ * editing source. The settings section has no `apiKey` field, so the
+ * credential can never be persisted through it.
  *
  * `available()` is the cheap, **synchronous** check the seam contract
  * requires: it reports whether a *resolution path* exists for every required
@@ -44,9 +47,9 @@ import { deadline } from "@deepseek-ai/dsh-timeout";
 import type { Context } from "@deepseek-ai/cordis";
 
 import {
-	Config,
 	GOOGLE_SEARCH_API_KEY_ENV,
 	GOOGLE_SEARCH_ENGINE_ID_ENV,
+	Settings,
 	googleSearchConfigPathExists,
 	resolveGoogleSearchCredential,
 	resolveGoogleSearchEngineId,
@@ -66,24 +69,35 @@ export const GOOGLE_SEARCH_PROVIDER_ID = "google";
 /**
  * Options for building the Google search provider.
  *
- * All fields are injectable for tests: `settings` is the configuration
- * section (defaults to the schema's defaults), `env` is the env source the
- * credential/engine-id fallbacks are resolved from (defaults to
- * `process.env`), `ctx` is the plugin context supplying the credential and
- * environment planes (defaults to `undefined` — the bare provider path), and
- * `transport` is the HTTP transport used for search calls (defaults to the
- * runtime's global `fetch`). Production code builds the provider from the
- * plugin's configuration section with no options.
+ * All fields are injectable for tests: `settings` is the persisted settings
+ * section (defaults to the schema's defaults), `apiKey` is the literal
+ * credential from the plugin composition input (a `role("secret")` value that
+ * is never persisted), `env` is the env source the credential/engine-id
+ * fallbacks are resolved from (defaults to `process.env`), `ctx` is the plugin
+ * context supplying the credential and environment planes (defaults to
+ * `undefined` — the bare provider path), and `transport` is the HTTP transport
+ * used for search calls (defaults to the runtime's global `fetch`).
+ * Production code builds the provider from the plugin's settings section plus
+ * the literal composition key.
  */
 export interface GoogleSearchProviderOptions {
 	/**
-	 * The configuration section (defaults to the schema's defaults). A thunk
-	 * rather than a value when the section can change at runtime (the plugin
-	 * entry passes the settings-section source): the provider re-reads it for
-	 * every operation, so a settings change takes effect without rebuilding
-	 * the provider or re-registering it on the seam.
+	 * The persisted settings section (defaults to the schema's defaults). A
+	 * thunk rather than a value when the section can change at runtime (the
+	 * plugin entry passes the settings-section source): the provider re-reads
+	 * it for every operation, so a settings change takes effect without
+	 * rebuilding the provider or re-registering it on the seam. This section
+	 * never carries an `apiKey` (see `./config.ts`).
 	 */
 	readonly settings?: GoogleSearchSettings | (() => GoogleSearchSettings);
+	/**
+	 * The literal API credential from the plugin composition input, if any.
+	 * A `role("secret")` value that is resolved per operation and is **never**
+	 * part of the persisted settings, so it can never be written to the
+	 * settings file. When absent, the credential is resolved from the
+	 * `apiKeyEnv` reference through the credential/environment planes.
+	 */
+	readonly apiKey?: string;
 	/** Env source for the credential/engine-id fallbacks (defaults to `process.env`). */
 	readonly env?: Record<string, string | undefined>;
 	/** Plugin context supplying the credentials/launching-environment planes. */
@@ -110,8 +124,12 @@ export function buildGoogleSearchProvider(options: GoogleSearchProviderOptions =
 	// the settings-section source thunk; tests pass a plain section).
 	const settingsSource = (): GoogleSearchSettings => {
 		const s = options.settings;
-		return typeof s === "function" ? s() : s ?? Config(undefined);
+		return typeof s === "function" ? s() : s ?? Settings(undefined);
 	};
+	// The literal credential from the plugin composition input (a
+	// role("secret") value that is never persisted). Resolved per operation,
+	// ahead of the apiKeyEnv reference planes.
+	const literalApiKey = options.apiKey;
 	const env = options.env ?? process.env;
 	const ctx = options.ctx;
 	const transport = options.transport ?? defaultGoogleHttpTransport;
@@ -121,7 +139,7 @@ export function buildGoogleSearchProvider(options: GoogleSearchProviderOptions =
 			.map((name) =>
 				name === GOOGLE_SEARCH_ENGINE_ID_ENV
 					? `the engine id (setting "engineId" or environment variable ${name})`
-					: `the API credential (setting "apiKey", or environment variable ${name})`
+					: `the API credential (set the ${name} environment variable, or store the credential under the "apiKeyEnv" name in the Harness credential facilities)`
 			)
 			.join(" and ")} (set them at runtime; never commit the credential)`;
 
@@ -129,13 +147,13 @@ export function buildGoogleSearchProvider(options: GoogleSearchProviderOptions =
 		id: GOOGLE_SEARCH_PROVIDER_ID,
 		// Cheap, synchronous usability check, no network calls, no async
 		// resolution (seam contract): a resolution PATH exists.
-		available: () => googleSearchConfigPathExists(ctx, settingsSource(), env),
+		available: () => googleSearchConfigPathExists(ctx, settingsSource(), literalApiKey, env),
 		async search(request: WebSearchRequest, signal?: AbortSignal): Promise<WebSearchResult> {
 			// Snapshot the section once at the operation's entry so one search
 			// never mixes two sections (the settings section can change
 			// between searches).
 			const settings = settingsSource();
-			const apiKey = await resolveGoogleSearchCredential(ctx, settings, env);
+			const apiKey = await resolveGoogleSearchCredential(ctx, settings, literalApiKey, env);
 			const cx = resolveGoogleSearchEngineId(settings, env);
 
 			if (apiKey === undefined || cx === undefined) {
