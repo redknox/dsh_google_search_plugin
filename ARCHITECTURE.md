@@ -66,9 +66,9 @@ specific provider. Its job:
    cancellation.
 5. Map Google failures to structured errors (see ENGINEERING.md §7).
 
-The concrete Google search **product/API** is an **adapter-layer choice**. The initial
-target for the MVP is Google Programmable Search — Custom Search JSON API (recorded in
-"Initial Google backend target (MVP)" below). Swapping or adding a backend later —
+The concrete Google search **product/API** is an **adapter-layer choice**. The
+target for the MVP is the **Gemini API `google_search` grounding tool** (recorded in
+"Google backend target (MVP)" below). Swapping or adding a backend later —
 including migrating to another Google search API/product — means writing a new (or
 re-pointed) adapter against the same seam; it must not touch the domain layer or the tool
 layer.
@@ -82,12 +82,22 @@ The external, third-party API. It is **outside** the repository's contract surfa
   committed** (ENGINEERING.md §4);
 - claims about its behavior require verification evidence (ENGINEERING.md §5).
 
-## Initial Google backend target (MVP)
+## Google backend target (MVP)
 
-The initial Google backend target for the MVP is **Google Programmable Search —
-[Custom Search JSON API](https://developers.google.com/custom-search/v1) semantics**: a
-REST search endpoint that takes a query string and returns a list of result items with
-url, title, and snippet fields, which map onto `WebSearchSource`.
+The Google backend target for the MVP is the **Gemini API
+[`google_search` grounding tool](https://ai.google.dev/gemini-api/docs/search-grounding)**:
+a `generateContent` call to a Gemini model with `tools: [{ google_search: {} }]`, which
+returns the model's synthesized answer plus `groundingMetadata` — the grounding chunks
+(`web.uri` + `web.title`) that map onto `WebSearchSource`, and the answer text that maps
+onto the seam's `content`.
+
+**Why not the Custom Search JSON API.** The original target, Google Programmable Search —
+[Custom Search JSON API](https://developers.google.com/custom-search/v1), is being retired
+by Google (announced January 2026; retirement 2027-01-01; already closed to new
+customers). A new deployment cannot provision the `cx` it requires, so the backend was
+migrated to the Gemini grounding tool (Issue #7). The grounding tool needs a single
+Gemini API key — no engine id, no separate billing project — and additionally returns a
+synthesized answer, which the Custom Search API never did.
 
 **Configuration shape (contract, not values).** The adapter is configurable
 **without editing runtime source**: it carries a declarative configuration schema
@@ -97,16 +107,14 @@ on every search. The schema splits into two kinds of field:
 | Setting | Kind | Notes |
 |---|---|---|
 | API credential | secret, runtime-only | Resolved **per operation** from, in order: a literal secret config value, the Harness credential facilities, the launching environment, then the process environment. **Never committed**, and never stored in ordinary settings (ENGINEERING.md §4). The literal value is a `role("secret")` field on the plugin's *composition* config, accepted only as the value handed to `ctx.plugin(...)` and stripped from every *read* surface; the persisted settings schema contains **no** credential field, and a `validate` hook rejects any settings write carrying one before it is persisted — so the ordinary settings path cannot place a raw key on disk. The recommended path is an environment-backed reference (the *name* of the variable is a setting, the *value* is not). This document names the *shape* of the requirement, not a specific variable name, and never a value. |
-| Search engine id (`cx`) | non-secret, runtime-only | Required where the selected Google product requires it (Custom Search JSON API requires a `cx` identifying the Programmable Search Engine). A non-secret setting that falls back to an environment variable. Environment-specific ids are deployment data, **not** repository contract data: no real `cx` value is recorded here or in any checked-in default. |
-| Behavior settings | non-secret, have defaults | Request-shaping settings (result-limit default, language/region/safe-search, request timeout). Every field carries a user-facing description and a default that preserves the simplest usable search; they are ordinary settings (not secrets) and are persisted like any other non-secret setting. |
+| Behavior settings | non-secret, have defaults | The Gemini model name (pattern-validated, with a default) and the per-request timeout. Every field carries a user-facing description and a default that preserves the simplest usable search; they are ordinary settings (not secrets) and are persisted like any other non-secret setting. The previous Custom Search behavior settings (result-limit default, language/region/safe-search) were removed with the backend migration: the grounding API exposes no per-request control for them, so keeping them would be dead configuration. The per-request result bound is enforced by the seam on the way back; language, region, and SafeSearch are **not supported** by this backend. |
 
-Recorded here is the **shape** of the configuration (a secret credential + a non-secret
-engine id + non-secret behavior settings, each with a documented resolution/default
-rule). Real credential values and environment-specific ids are deployment data and must
-not appear in this repository's contract documents, config defaults, or examples. When
-no resolution path exists for a required value, the provider reports itself
-unavailable and a search fails with a stable, actionable error that names the setting
-and the environment variable to fix — never a value.
+Recorded here is the **shape** of the configuration (a secret credential + non-secret
+behavior settings, each with a documented resolution/default rule). Real credential
+values are deployment data and must not appear in this repository's contract documents,
+config defaults, or examples. When no resolution path exists for a required value, the
+provider reports itself unavailable and a search fails with a stable, actionable error
+that names the setting and the environment variable to fix — never a value.
 
 **Adapter-layer choice.** The concrete Google search product/API is an adapter-layer
 choice, not a domain decision. A future migration to, or addition of, another Google
@@ -135,10 +143,12 @@ described in §2. Google is *one* implementation of it. Consequences:
 - Nothing in layers 1–2 may depend on Google. The dependency arrow points one way only:
   adapter → Google.
 
-> **Evidence-matched wording.** As of Issue #1 (contracts only) there is no runtime
-> implementation and no live Google API call, so Google is described as *planned* /
-> *initial*, not *validated*. Per ENGINEERING.md §5, the wording is upgraded to
-> "validated" only once real Google API + Harness E2E evidence exists (Issue #7).
+> **Evidence-matched wording.** The Google backend (the Gemini `google_search`
+> grounding tool) is **validated**: real Gemini API + real Harness E2E evidence
+> exists (Issue #7, recorded in `E2E_VERIFICATION.md`). Per ENGINEERING.md §5,
+> claims about the backend's behavior are limited to what that evidence covers;
+> capabilities the backend does not expose (language, region, SafeSearch) are
+> documented as unsupported, not claimed.
 
 ## Search and Fetch/Read are separate capabilities
 
@@ -163,28 +173,32 @@ The first release (MVP) delivers exactly:
 
 1. A DSH plugin that registers **one search provider** against `ctx.web`.
 2. A Google adapter implementing `WebSearchProvider`:
-   - `search()` calls the Google Search API with the request's `query`, honors
-     `maxResults` and `signal`, and applies the configured behavior settings
-     (result-limit default, language/region/safe-search, request timeout);
-   - maps Google results to `WebSearchSource[]` (`url`, `title?`, `snippet?`,
-     `publishedAt?`), leaving absent fields `undefined`;
+   - `search()` calls the Gemini API `google_search` grounding tool with the
+     request's `query`, honors `signal`, and applies the configured behavior
+     settings (model, request timeout); the seam enforces the per-request
+     `maxResults` bound on the way back (the grounding API has no per-request
+     result-count control);
+   - maps the grounding response to `WebSearchSource[]` (`url`, `title?`) and the
+     synthesized answer to `content`, leaving absent fields `undefined` (the
+     grounding response carries no per-source snippet or date, so `snippet?` and
+     `publishedAt?` stay absent);
    - `available()` returns a cheap synchronous check — whether a **resolution path**
-     exists for every required value (a credential source and an engine-id source) —
-     without network access; the actual per-operation resolution happens in `search()`.
-3. Runtime configuration per the shape recorded in "Initial Google backend target
-   (MVP)": a secret API credential (resolved per operation, never stored in ordinary
-   settings) and, where the selected Google product requires it, a non-secret search
-   engine id (`cx`) — both supplied at runtime, never committed — plus non-secret
-   behavior settings with defaults and user-facing descriptions; a clear structured
-   error naming the setting and environment variable when a value is missing.
+     exists for every required value (a credential source) — without network
+     access; the actual per-operation resolution happens in `search()`.
+3. Runtime configuration per the shape recorded in "Google backend target (MVP)": a
+   secret API credential (resolved per operation, never stored in ordinary settings)
+   — supplied at runtime, never committed — plus non-secret behavior settings with
+   defaults and user-facing descriptions; a clear structured error naming the setting
+   and environment variable when a value is missing.
 4. Tests for the mapping logic using recorded fixtures (no live network in CI), and
    configuration tests covering credential isolation and validation (Issue #6).
 
 ## Non-goals (first release)
 
 - **No Fetch/Read capability.** No `WebFetchProvider`, no page-content retrieval.
-- **No claim that the Google backend is validated/verified.** That wording is reserved
-  for after live verification provides evidence (Issue #7).
+- **No claim of capabilities the backend does not expose.** Language, region, and
+  SafeSearch are not supported by the Gemini grounding backend and are documented
+  as such, not claimed (Issue #7).
 - **No implementation of multiple Google APIs** in this issue. Only the adapter boundary
   is preserved so a future migration to, or addition of, another Google search
   API/product can be done without touching the domain contract, when a real requirement
@@ -193,7 +207,7 @@ The first release (MVP) delivers exactly:
   Google wire coupling (the seam already provides that boundary; this plugin adds no
   framework of its own).
 - **No new model-facing tools.** Only a provider for the existing `web_search` tool.
-- **No credentials or `cx` values** in settings, config defaults, or the repository.
+- **No credential values** in settings, config defaults, or the repository.
 - **No automatic follow-up fetches** of search results.
 - **No UI/presentation changes.** Presentation is owned by the DSH tool layer.
 

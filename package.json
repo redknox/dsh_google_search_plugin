@@ -25,7 +25,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "pretest": "tsc -p tsconfig.json",
     "test": "node --test \"lib-test/test/*.test.js\"",
-    "check": "npm run typecheck && npm run build && npm run test"
+    "check": "npm run typecheck && npm run build && npm run test",
+    "e2e": "tsc -p tsconfig.e2e.json && node lib-e2e/e2e/run-e2e.js"
   },
   "engines": {
     "node": ">=24"

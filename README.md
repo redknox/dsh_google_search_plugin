@@ -15,13 +15,16 @@ in later issues, its runtime implementation.
   request into a Google search call and maps Google's response back to the normalized
   search result.
 - **Google** is the **initial planned backend for the MVP** (the first planned search
-  backend). The initial target is Google Programmable Search — Custom Search JSON API
-  semantics; the concrete Google search product/API is an **adapter-layer choice** and
-  not part of the domain contract.
-- Its runtime configuration requires an **API credential** and, where the selected Google
-  product requires it, a **search engine id (`cx`)** — supplied at runtime, never
-  committed (see [ARCHITECTURE.md](ARCHITECTURE.md), "Initial Google backend target
-  (MVP)").
+  backend). The backend is the **Gemini API `google_search` grounding tool**: the query
+  is sent to a Gemini model with the `google_search` tool enabled, and the model's
+  synthesized answer plus its grounding sources are mapped onto the seam. The concrete
+  Google search product/API is an **adapter-layer choice** and not part of the domain
+  contract. (The original Custom Search JSON API target is being retired by Google and
+  is closed to new customers — see [ARCHITECTURE.md](ARCHITECTURE.md), "Google backend
+  target (MVP)".)
+- Its runtime configuration requires a single **API credential** (a Gemini API key) —
+  supplied at runtime, never committed (see [ARCHITECTURE.md](ARCHITECTURE.md),
+  "Google backend target (MVP)").
 - It speaks the stable, **provider-neutral search domain contract**. Google's wire
   format stays inside the adapter and never leaks into the domain model.
 - It is **search-only** in its first release: it makes the model-facing `web_search`
@@ -51,10 +54,10 @@ in later issues, its runtime implementation.
 | `ENGINEERING.md` | Normative engineering principles for human and AI contributors. |
 | `ARCHITECTURE.md` | The stable domain vs external-provider boundary, the initial Google backend target (MVP) and its configuration shape, the Search / Fetch-Read capability split, and first-release scope + non-goals. |
 | `src/index.ts` | Plugin entry (Issues #2, #6): registers the Google search provider on the `ctx.web` seam through public DSH/Cordis contracts, carries the composition `Config` schema, and installs the `google-search` settings section from the persisted `Settings` schema (no `apiKey` field, with the `validate` hook that rejects a raw key) — re-read per search. |
-| `src/provider/google.ts` | The Google search provider (Issues #2, #4, #6): the real `WebSearchProvider` for the `ctx.web` seam — resolves the credential and engine id per operation (literal config → Harness credentials → launching environment → process environment), applies the configured behavior settings (`maxResults`, `language`, `region`, `safeSearch`, `requestTimeoutMs`), translates the seam request into a Google Custom Search call, normalizes the response, and maps every failure onto a structured `WebError`. |
-| `src/provider/config.ts` | Configuration and credential handling (Issues #4, #6): the schemastery `Settings` schema (the persisted, non-secret settings with defaults + descriptions — **no** `apiKey` field) and the composition `Config` schema (settings + a `role("secret")` `apiKey` accepted only as plugin composition input), the `validate` hook that rejects any settings write carrying a raw key, per-operation credential resolution (literal → Harness credentials → launching environment → process environment), engine-id resolution, and the `available()` path-exists check. Names documented, values never committed. |
-| `src/provider/transport.ts` | Google provider edge (Issues #4, #6): request URL serialization (endpoint + `key`/`cx`/`q`/`num`/`lr`/`gl`/`safe`), the fetch transport (injectable for tests), status/reason-based error classification (including `TimeoutReason` from the provider's `requestTimeoutMs` deadline), and a credential-safe cause chain (the raw transport error is never chained — URL tokens are scrubbed because the request URL carries the API key). The only place that knows the Google endpoint and parameter set. |
-| `src/provider/normalize.ts` | Google-response → DSH seam mapping (Issues #3, #4): translates a parsed Google Custom Search response into the `@deepseek-ai/dsh-web` `WebSearchResult`/`WebSearchSource` types. The only place that knows Google's wire field names; optional fields stay absent, an *absent* `items` field (Google's real zero-result wire shape) is a valid empty result, and `truncated` is left to the seam. |
+| `src/provider/google.ts` | The Google search provider (Issues #2, #4, #6, #7): the real `WebSearchProvider` for the `ctx.web` seam — resolves the credential per operation (literal config → Harness credentials → launching environment → process environment), applies the configured behavior settings (`model`, `requestTimeoutMs`), translates the seam request into a Gemini `google_search` grounding call, normalizes the response, and maps every failure onto a structured `WebError`. |
+| `src/provider/config.ts` | Configuration and credential handling (Issues #4, #6, #7): the schemastery `Settings` schema (the persisted, non-secret settings with defaults + descriptions — **no** `apiKey` field) and the composition `Config` schema (settings + a `role("secret")` `apiKey` accepted only as plugin composition input), the `validate` hook that rejects any settings write carrying a raw key, per-operation credential resolution (literal → Harness credentials → launching environment → process environment), and the `available()` path-exists check. Names documented, values never committed. |
+| `src/provider/transport.ts` | Google provider edge (Issues #4, #6, #7): the Gemini grounding request (endpoint + model + prompt + `google_search` tool, the API key in the `x-goog-api-key` header — the URL carries no credential), the fetch transport (injectable for tests), status/reason-based error classification (including `TimeoutReason` from the provider's `requestTimeoutMs` deadline), and a credential-safe cause chain (the raw transport error is never chained — URL tokens are scrubbed). The only place that knows the Gemini endpoint and wire shape. |
+| `src/provider/normalize.ts` | Google-response → DSH seam mapping (Issues #3, #4, #7): translates a parsed Gemini grounding response into the `@deepseek-ai/dsh-web` `WebSearchResult`/`WebSearchSource` types. The only place that knows the Gemini wire field names; the candidate answer maps to `content`, the grounding chunks map to `sources` (deduped by URL), optional fields stay absent, an *absent* `groundingMetadata` field (Gemini's real zero-result wire shape) is a valid empty result, and `truncated` is left to the seam. |
 | `src/provider/errors.ts` | Google-failure → `WebError` mapping (Issue #3): classifies a Google search failure into a DSH `WebError` with a machine-routable string code, reusing the DSH shared taxonomy where it exists. No closed local error taxonomy. |
 | `test/` | Offline tests: plugin registration/discovery/teardown, conformance of the normalization and error mapping to the DSH seam types, the full adapter (request serialization, normalization, empty results, and every failure path), end-to-end tool wiring (Issue #5): the real `web_search` tool (`@deepseek-ai/dsh-tool-web`), registry, seam, and cooperative-timeout policy composed with the real Google provider, driven through `ctx.tools.execute`, and configuration/credential handling (Issue #6): schema defaults and validation, the `redactSecrets` read-surface isolation contract, per-operation credential resolution order, `available()` path semantics, and the settings section against a real `FileSettingsProvider` — including a regression test that a raw `apiKey` submitted through the ordinary settings update path is rejected by the `validate` hook and never written to disk — all against injected mock transports, mock credential/launch-environment services, and fixture values. No network, no live credentials. |
 | `package.json` / `tsconfig*.json` | ESM package + TypeScript build/test configuration (Node >= 24). |
@@ -95,13 +98,17 @@ defaults preserve the simplest usable search):
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `apiKeyEnv` | `GOOGLE_SEARCH_API_KEY` | The name of the environment variable (or Harness credential reference) that holds the API key. The *name* is a setting; the *value* is never one. |
-| `engineId` | `""` | The Programmable Search Engine id (`cx`). Blank falls back to the `GOOGLE_SEARCH_ENGINE_ID` environment variable. |
-| `maxResults` | `10` | Default result count per search (1–10, the API maximum). A per-request `maxResults` bound still clamps it. |
-| `safeSearch` | `"off"` | `"off"` or `"active"`. Only `"active"` is sent to Google (`safe=active`); `"off"` is Google's own default and is omitted. |
-| `language` | `""` | Optional result-language preference, sent as `lr` (e.g. `lang_ja`). Blank omits the parameter. |
-| `region` | `""` | Optional country/region preference, sent as `gl` (e.g. `US`). Blank omits the parameter. |
+| `apiKeyEnv` | `GEMINI_API_KEY` | The name of the environment variable (or Harness credential reference) that holds the Gemini API key. The *name* is a setting; the *value* is never one. |
+| `model` | `gemini-3.6-flash` | The Gemini model that performs the grounded search. Pattern-validated (`[a-z0-9][a-z0-9._-]*`). |
 | `requestTimeoutMs` | `30000` | Per-request timeout in milliseconds (minimum 1000). Expiry fails the search with a stable `TIMEOUT` error. |
+
+The previous Custom Search settings (`engineId`, `maxResults`, `language`,
+`region`, `safeSearch`) were **removed** with the backend migration (Issue #7):
+the Gemini grounding API exposes no per-request engine id, result count,
+language, region, or SafeSearch control, so keeping them would be dead
+configuration. The per-request result bound is still enforced by the DSH seam
+on the way back (its `maxResults`), and language/region/SafeSearch are
+**not supported** by this backend — documented, not claimed.
 
 **Credential handling** (ENGINEERING.md §4 — values are **never committed** and
 never stored in ordinary settings). The API key is resolved **per operation**,
@@ -124,9 +131,6 @@ The persisted settings schema (the `google-search` settings section) contains
 `FileSettingsProvider` regression test proves — that the ordinary
 `ctx.settings.update()` path cannot place a raw key on disk.
 
-The engine id (`cx`) is a non-secret value: the `engineId` setting, then the
-`GOOGLE_SEARCH_ENGINE_ID` environment variable.
-
 When no resolution path exists for a required value, the provider registers but
 reports `available()` `false` (the seam keeps reporting the capability as
 unavailable), and a direct `search()` call fails with a structured
@@ -144,12 +148,14 @@ fix — never a value.
   `WebError` error mapping, using the public `@deepseek-ai/dsh-web` types as the
   stable contract (no parallel domain) — with offline conformance tests.
 - **Issue #4** (approved): the real Google search backend adapter —
-  request serialization against the documented Custom Search JSON API, response
+  request serialization against the documented wire API, response
   normalization, stable failure mapping (auth/config, quota/rate-limit,
   timeout/cancel, provider error, malformed response), runtime configuration from
   environment variables, and offline tests with mock transports. The existing
   `web_search` tool (owned by `@deepseek-ai/dsh-tool-web`) reports the capability
-  as available once the runtime configuration is supplied.
+  as available once the runtime configuration is supplied. (Issue #7 re-targeted
+  the backend from the Custom Search JSON API to the Gemini `google_search`
+  grounding tool; the adapter contract is unchanged.)
 - **Issue #5** (approved): the Google backend wired into the Harness tool
   contract — end-to-end tests that compose the **real** `web_search` tool
   (`@deepseek-ai/dsh-tool-web`), the tool registry, the `ctx.web` seam, and the
@@ -157,11 +163,10 @@ fix — never a value.
   through `ctx.tools.execute` (success, `maxResults` bound, multi-query merge,
   empty results, invalid input, provider failures, cancellation, and timeout).
   The plugin stays provider-only; the tool contract remains Google-neutral.
-- **Issue #6** (in progress, pending review): secure configuration and
+- **Issue #6** (approved): secure configuration and
   credential handling — a schemastery `Settings` schema for the persisted
-  non-secret settings (result limit, language/region/safe-search, request
-  timeout) with user-facing descriptions and defaults that preserve the
-  simplest usable search; the API key kept out of ordinary settings **by
+  non-secret settings with user-facing descriptions and defaults that preserve
+  the simplest usable search; the API key kept out of ordinary settings **by
   design** — the persisted `Settings` schema has no `apiKey` field, the literal
   key is accepted only as plugin composition input (a `role("secret")` field on
   the composition `Config`, stripped from every read surface), a `validate`
@@ -171,6 +176,14 @@ fix — never a value.
   `MISSING_CREDENTIAL` failures that name the setting and the environment
   variable; and tests proving credential isolation and validation, including a
   `FileSettingsProvider` regression test that a raw key submitted through the
-  ordinary settings path is rejected and never reaches disk.
-- Live end-to-end verification against the real Google API arrives in a later
-  issue (#7); until then the wording stays *planned*, not *validated*.
+  ordinary settings path is rejected and never reaches disk. (The Issue #7
+  migration re-targeted the settings surface to the Gemini backend: `apiKeyEnv`
+  now defaults to `GEMINI_API_KEY`, and the Custom-Search-only settings were
+  removed — see the settings table above.)
+- **Issue #7** (in progress): verify real Google Search API behavior
+  end-to-end — and, in the process, migrate the backend from the Custom Search
+  JSON API (being retired by Google, closed to new customers) to the Gemini
+  API `google_search` grounding tool. Live verification against the real
+  Gemini API through the real Harness `web_search` tool path is recorded in
+  [E2E_VERIFICATION.md](E2E_VERIFICATION.md); the offline suite remains the
+  no-network, no-credential path.

@@ -1,5 +1,8 @@
 node_modules/
 lib/
 lib-test/
+lib-e2e/
 *.log
 .DS_Store
+# Live E2E credential file (Issue #7) — real values, NEVER committed.
+.env.e2e.local

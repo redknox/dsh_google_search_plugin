@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "outDir": "lib-e2e",
+    "noEmit": false
+  },
+  "include": ["src/**/*.ts", "e2e/**/*.ts"]
+}

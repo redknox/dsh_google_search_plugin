@@ -1,5 +1,5 @@
 /**
- * DSH plugin entry (Issues #2, #4, #6) — provider-only.
+ * DSH plugin entry (Issues #2, #4, #6, #7) — provider-only.
  *
  * Registers the Google search provider on the web capability seam
  * (`ctx.web`, `@deepseek-ai/dsh-web`) through public DSH extension
@@ -11,6 +11,16 @@
  * `@deepseek-ai/dsh-tool-web`; this plugin only supplies a search backend
  * to that existing tool (ARCHITECTURE.md).
  *
+ * **Backend (Issue #7 migration).** The search backend is the **Gemini API
+ * `google_search` grounding tool** (`POST …/v1beta/models/{model}:generateContent`
+ * with `tools: [{ google_search: {} }]`), not the Custom Search JSON API:
+ * the latter is being retired by Google (announced January 2026, retirement
+ * 2027-01-01, closed to new customers) and is not a viable long-term target.
+ * The grounding API needs only an API key — no engine id, no per-request
+ * result-count/language/region/SafeSearch controls. The response carries a
+ * synthesized answer (mapped to the seam's `content`) and the grounding
+ * sources (mapped to the seam's `sources`).
+ *
  * Configuration (Issue #6): the plugin carries a schemastery {@link Config}
  * schema for its composition input so it is configurable **without editing
  * runtime source** — the Harness validates and supplies it through the
@@ -18,19 +28,19 @@
  * persisted {@link Settings} schema (which has **no** `apiKey` field) is
  * exposed as the `google-search` settings section, with a `validate` hook
  * that rejects any write carrying a raw key before it is persisted. The
- * Google API credential is normally supplied through an environment-backed
- * reference (`apiKeyEnv`, a `role("credential-ref")` field) resolved per
- * operation through the Harness credential facilities or the launching
- * environment — never stored in ordinary settings (ENGINEERING.md §4). A
- * literal key is accepted only as composition input (a `role("secret")`
- * field on {@link Config}), passed straight to the provider and stripped from
- * every read surface.
+ * API credential is normally supplied through an environment-backed
+ * reference (`apiKeyEnv`, a `role("credential-ref")` field, default
+ * `GEMINI_API_KEY`) resolved per operation through the Harness credential
+ * facilities or the launching environment — never stored in ordinary
+ * settings (ENGINEERING.md §4). A literal key is accepted only as
+ * composition input (a `role("secret")` field on {@link Config}), passed
+ * straight to the provider and stripped from every read surface.
  *
  * The provider's `available()` reports that a *resolution path* exists for
- * the credential and engine id (the canonical DSH credential pattern); when
- * no path yields a value, `search()` fails with a structured, actionable
+ * the credential (the canonical DSH credential pattern); when no path yields
+ * a value, `search()` fails with a structured, actionable
  * `MISSING_CREDENTIAL` error naming the missing setting/environment
- * variables (never their values).
+ * variable (never its value).
  *
  * Lifecycle: `ctx.web.registerSearchProvider` returns a disposer that is
  * disposed with the calling fiber, so Cordis unregisters the provider
@@ -43,8 +53,7 @@ import { installSettingsSection, settingsNamespace } from "@deepseek-ai/dsh-sett
 import {
 	Config,
 	Settings,
-	GOOGLE_SEARCH_API_KEY_ENV,
-	GOOGLE_SEARCH_ENGINE_ID_ENV,
+	GEMINI_API_KEY_ENV,
 	rejectApiKeyInSettings,
 	settingsFromConfigInput,
 	type GoogleSearchConfigInput,
@@ -56,8 +65,7 @@ export { buildGoogleSearchProvider, GOOGLE_SEARCH_PROVIDER_ID } from "./provider
 export {
 	Config,
 	Settings,
-	GOOGLE_SEARCH_API_KEY_ENV,
-	GOOGLE_SEARCH_ENGINE_ID_ENV,
+	GEMINI_API_KEY_ENV,
 	rejectApiKeyInSettings,
 	settingsFromConfigInput
 } from "./provider/config.js";

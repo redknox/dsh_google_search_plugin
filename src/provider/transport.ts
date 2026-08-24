@@ -1,155 +1,165 @@
 /**
- * Google Custom Search transport (Issue #4) — the provider edge.
+ * Gemini `google_search` grounding transport (Issue #7 migration) — the
+ * provider edge.
  *
  * This is a **Google-adapter-owned** module: it is the only place in the
- * plugin that knows the Google endpoint, its query parameters (`key`, `cx`,
- * `q`, `num`), and its HTTP error shape. Per ARCHITECTURE.md §3 the concrete
- * Google product/API is an adapter-layer choice; the endpoint and parameter
- * set live here and nowhere else, so re-pointing the adapter never touches
- * the seam or the domain.
+ * plugin that knows the Gemini endpoint, its request shape, and its HTTP
+ * error shape. Per ARCHITECTURE.md §3 the concrete Google product/API is an
+ * adapter-layer choice; the endpoint and request shape live here and nowhere
+ * else, so re-pointing the adapter never touches the seam or the domain.
  *
- * Documented request shape (Google Programmable Search — Custom Search JSON
- * API, v1):
+ * **Why Gemini grounding and not the Custom Search JSON API** (Issue #7):
+ * the Custom Search JSON API (the previous backend) is being retired by
+ * Google — announced January 2026, retirement 2027-01-01, and already closed
+ * to new customers — so it is not a viable long-term target. The plugin's
+ * backend is therefore the **Gemini API `google_search` grounding tool**:
+ * one API key (no engine id, no separate billing project), and the response
+ * carries both a synthesized answer and the grounding sources.
  *
- *   GET https://customsearch.googleapis.com/customsearch/v1
- *       ?key=<API credential>
- *       &cx=<Programmable Search Engine id>
- *       &q=<query>
- *       [&num=<1..10>]
- *       [&lr=<language restriction, e.g. lang_ja>]
- *       [&gl=<two-letter country code, e.g. US>]
- *       [&safe=<off|active>]
+ * Documented request shape (Gemini API, v1beta, `google_search` tool):
  *
- * The API key travels as a query parameter because the API authenticates
- * that way; it is therefore **never** included in any error message or log
- * produced by this module (messages carry only status, reason, and the
- * provider's own error text).
+ *   POST https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent
+ *   headers:
+ *     x-goog-api-key: <API credential>
+ *     Content-Type: application/json
+ *   body:
+ *     {
+ *       "contents": [{ "role": "user", "parts": [{ "text": <prompt> }] }],
+ *       "tools": [{ "google_search": {} }]
+ *     }
+ *
+ * The prompt wraps the caller's query in a fixed instruction (see
+ * {@link buildGeminiSearchPrompt}) so the model performs a web search and
+ * answers from the results. The API key travels in the **request header**,
+ * never in the URL: the serialized request URL contains only the model name,
+ * and no error message or log produced by this module ever carries the key.
  *
  * Error classification is deterministic and status/reason-based — no
  * free-text heuristics (ENGINEERING.md §2):
  *
- *   - `reason: quotaExceeded | dailyLimitExceeded`        → quota
- *   - `reason: rateLimitExceeded | userRateLimitExceeded` → rate_limit
- *   - `reason: accessNotConfigured`                       → provider_failure
- *   - HTTP 401 / 403                                      → invalid_credential
- *   - HTTP 429                                            → rate_limit
+ *   - `reason: QUOTA_EXCEEDED`              → quota
+ *   - `reason: RESOURCE_EXHAUSTED`          → rate_limit
+ *   - HTTP 429                              → rate_limit
  *   - HTTP 400 with the documented "API key not valid"
- *     error text                                          → invalid_credential
- *   - HTTP 400 (other)                                    → invalid_request
- *   - HTTP 5xx and any other non-2xx                      → provider_failure
+ *     error text                            → invalid_credential
+ *   - HTTP 401 / 403 (incl. the
+ *     `API_KEY_SERVICE_BLOCKED` reason)     → invalid_credential
+ *   - HTTP 400 (other)                      → invalid_request
+ *   - HTTP 404 (model not available)        → provider_failure
+ *   - HTTP 5xx and any other non-2xx        → provider_failure
  *
  * Transport-level failures (connection refused, DNS, TLS, …) are classified
  * by the caller from the thrown error and the forwarded signal: an aborted
  * caller signal is *aborted* (or *timeout* when the abort reason is a
  * `TimeoutError`), anything else is *provider_failure*.
  *
- * **Cause-chain credential safety.** Because the request URL carries the API
- * credential as a query parameter, the raw thrown transport error is never
- * chained as `WebError.cause`: a production transport (or a proxy in front
- * of it) may embed the full request URL in its error text, and the cause is
- * exactly what log serializers walk. Instead, a sanitized stand-in — the
- * failure's `name`/`code` plus a bounded message with URL tokens scrubbed —
- * is chained (see {@link sanitizeTransportCause}).
+ * **Cause-chain credential safety.** The credential lives in a request
+ * header, not the URL, but a production transport (or a proxy in front of
+ * it) may still embed request details in its error text. The raw thrown
+ * transport error is therefore never chained as `WebError.cause`: a
+ * sanitized stand-in — the failure's `name`/`code` plus a bounded message
+ * with URL tokens scrubbed — is chained instead (see
+ * {@link sanitizeTransportCause}).
  */
 
 import type { WebSearchResult } from "@deepseek-ai/dsh-web";
 import { mapGoogleSearchFailure, type GoogleSearchFailureClass } from "./errors.js";
-import { normalizeGoogleSearchResponse } from "./normalize.js";
+import { normalizeGeminiSearchResponse } from "./normalize.js";
 
-/** The documented Custom Search JSON API v1 endpoint (adapter-layer choice). */
-export const GOOGLE_SEARCH_ENDPOINT = "https://customsearch.googleapis.com/customsearch/v1";
-
-/** The Custom Search JSON API returns at most 10 results per request. */
-export const GOOGLE_SEARCH_MAX_RESULTS_PER_REQUEST = 10;
+/** The documented Gemini API v1beta base endpoint (adapter-layer choice). */
+export const GEMINI_SEARCH_ENDPOINT_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
 
 /**
- * Everything the adapter needs to issue one Google search. The credential
- * values are runtime-only (ENGINEERING.md §4) and never serialized anywhere
- * except the request URL itself.
+ * The default grounding model. `gemini-3.6-flash` is the current flash model
+ * Google recommends for new users (the API's own 404 message for retired
+ * models points to it) and was verified live to perform `google_search`
+ * grounding (Issue #7 E2E).
  */
-export interface GoogleSearchRequestOptions {
-	/** The Google API credential (query parameter `key`). */
+export const GEMINI_SEARCH_DEFAULT_MODEL = "gemini-3.6-flash";
+
+/** The request header carrying the API credential (never the URL). */
+export const GEMINI_API_KEY_HEADER = "x-goog-api-key";
+
+/**
+ * The fixed instruction that wraps the caller's query. Verified live
+ * (Issue #7) to make the model perform a web search and answer from the
+ * results for both natural-language and keyword-style queries.
+ */
+export const GEMINI_SEARCH_PROMPT_TEMPLATE =
+	"Search the web and answer the following query using the results, citing sources:\n\n";
+
+/**
+ * Everything the adapter needs to issue one Gemini grounding search. The
+ * credential value is runtime-only (ENGINEERING.md §4) and is serialized
+ * into the request **header** only — never the URL, never any error
+ * message or log.
+ */
+export interface GeminiSearchRequestOptions {
+	/** The Gemini API credential (request header `x-goog-api-key`). */
 	readonly apiKey: string;
-	/** The Programmable Search Engine id (query parameter `cx`). */
-	readonly cx: string;
-	/** The search query (query parameter `q`). */
+	/** The grounding model (path segment `{model}:generateContent`). */
+	readonly model: string;
+	/** The search query (wrapped by the prompt template in the request body). */
 	readonly query: string;
-	/**
-	 * Requested result count (query parameter `num`), clamped to the API's
-	 * 1..10 range. Omitted = Google's default (10).
-	 */
-	readonly num?: number;
-	/**
-	 * Language restriction (query parameter `lr`, e.g. `lang_ja`). Omitted or
-	 * blank = no restriction (Google's default).
-	 */
-	readonly language?: string;
-	/**
-	 * Region boost (query parameter `gl`, a two-letter country code, e.g.
-	 * `US`). Omitted or blank = no boost (Google's default).
-	 */
-	readonly region?: string;
-	/**
-	 * SafeSearch filtering (query parameter `safe`): `"active"` enables
-	 * filtering, `"off"` disables it (Google's default). Omitted = Google's
-	 * default.
-	 */
-	readonly safe?: "off" | "active";
 }
 
 /**
- * Serialize one Google search into its request URL.
- *
- * Parameter order is fixed (`key`, `cx`, `q`, `num`, `lr`, `gl`, `safe`) so
- * the output is deterministic and fixture-stable. Values are percent-encoded
- * by `URLSearchParams`; the query is sent as-is (Google interprets it).
- * Blank `language`/`region` values are omitted (they mean "no restriction",
- * which is also Google's default — sending them would be noise).
- *
- * @throws {RangeError} when `num` is not an integer within 1..10 — a
- *   programming error, surfaced loudly rather than silently clamped.
+ * Build the model path for one grounding request. The model name is
+ * validated by the settings schema (a conservative token pattern that
+ * excludes `/` and `:`), so it cannot inject a path segment; this function
+ * still rejects a blank value loudly rather than serialize a broken URL.
  */
-export function buildGoogleSearchUrl(options: GoogleSearchRequestOptions): string {
-	const params = new URLSearchParams();
-	params.set("key", options.apiKey);
-	params.set("cx", options.cx);
-	params.set("q", options.query);
-	if (options.num !== undefined) {
-		if (!Number.isInteger(options.num) || options.num < 1 || options.num > GOOGLE_SEARCH_MAX_RESULTS_PER_REQUEST) {
-			throw new RangeError(
-				`google search 'num' must be an integer between 1 and ${GOOGLE_SEARCH_MAX_RESULTS_PER_REQUEST}, got: ${String(options.num)}`
-			);
-		}
-		params.set("num", String(options.num));
+export function buildGeminiSearchUrl(model: string): string {
+	const trimmed = model.trim();
+	if (trimmed.length === 0) {
+		throw new RangeError("gemini search 'model' must be a non-blank model name");
 	}
-	if (options.language !== undefined && options.language.trim().length > 0) {
-		params.set("lr", options.language);
+	if (trimmed.includes("/") || trimmed.includes(":")) {
+		throw new RangeError(`gemini search 'model' must not contain '/' or ':', got: ${trimmed}`);
 	}
-	if (options.region !== undefined && options.region.trim().length > 0) {
-		params.set("gl", options.region);
-	}
-	if (options.safe !== undefined) {
-		params.set("safe", options.safe);
-	}
-	return `${GOOGLE_SEARCH_ENDPOINT}?${params.toString()}`;
+	return `${GEMINI_SEARCH_ENDPOINT_BASE}/${trimmed}:generateContent`;
+}
+
+/** Build the fixed, deterministic prompt for one query. */
+export function buildGeminiSearchPrompt(query: string): string {
+	return `${GEMINI_SEARCH_PROMPT_TEMPLATE}${query}`;
 }
 
 /**
- * Map a `WebSearchRequest.maxResults` bound onto the API's `num` parameter:
- * the bound is applied at the request layer as a cost/latency optimization
- * (the seam still enforces it on the way back). Bounds above the API's 10
- * are clamped down; bounds below 1 are omitted (the seam truncates to them
- * regardless, so requesting is pointless).
+ * The fully serialized Gemini grounding request. The credential is in
+ * `headers` (never in `url`); `body` is the JSON string sent as-is.
  */
-export function googleNumForMaxResults(maxResults: number | undefined): number | undefined {
-	if (maxResults === undefined || !Number.isFinite(maxResults) || maxResults < 1) {
-		return undefined;
-	}
-	return Math.min(Math.floor(maxResults), GOOGLE_SEARCH_MAX_RESULTS_PER_REQUEST);
+export interface GeminiSearchHttpRequest {
+	/** The request URL (model path only — no credential). */
+	readonly url: string;
+	/** The request headers (carries the credential in `x-goog-api-key`). */
+	readonly headers: Record<string, string>;
+	/** The JSON request body (prompt + `google_search` tool). */
+	readonly body: string;
 }
 
-/** One HTTP response from the Google endpoint, undecoded. */
-export interface GoogleHttpResponse {
+/**
+ * Serialize one Gemini grounding search into its request. Key order in the
+ * body is fixed (`contents`, then `tools`) so the output is deterministic
+ * and fixture-stable.
+ */
+export function buildGeminiSearchRequest(options: GeminiSearchRequestOptions): GeminiSearchHttpRequest {
+	const body: Record<string, unknown> = {
+		contents: [{ role: "user", parts: [{ text: buildGeminiSearchPrompt(options.query) }] }],
+		tools: [{ google_search: {} }]
+	};
+	return {
+		url: buildGeminiSearchUrl(options.model),
+		headers: {
+			[GEMINI_API_KEY_HEADER]: options.apiKey,
+			"Content-Type": "application/json"
+		},
+		body: JSON.stringify(body)
+	};
+}
+
+/** One HTTP response from the Gemini endpoint, undecoded. */
+export interface GeminiHttpResponse {
 	/** The HTTP status code. */
 	readonly status: number;
 	/** The raw response body text (JSON for both success and error responses). */
@@ -157,45 +167,57 @@ export interface GoogleHttpResponse {
 }
 
 /**
- * A transport that performs one Google search request. The default
+ * A transport that performs one Gemini grounding request. The default
  * implementation uses the runtime's global `fetch`; tests inject a mock so
  * no network access or live credential is ever needed (ENGINEERING.md §8).
  *
- * @param url - the fully serialized request URL (includes the credential).
+ * @param request - the fully serialized request (credential in the header).
  * @param signal - the caller's cancellation signal, forwarded to the fetch.
  */
-export type GoogleHttpTransport = (url: string, signal?: AbortSignal) => Promise<GoogleHttpResponse>;
+export type GeminiHttpTransport = (
+	request: GeminiSearchHttpRequest,
+	signal?: AbortSignal
+) => Promise<GeminiHttpResponse>;
 
 /**
- * The default transport: the runtime's global `fetch`. Redirects are followed
- * (the endpoint does not redirect in practice); the body is returned as text
- * so the error classifier can inspect it.
+ * The default transport: the runtime's global `fetch`. Redirects are
+ * followed (the endpoint does not redirect in practice); the body is
+ * returned as text so the error classifier can inspect it.
  */
-export const defaultGoogleHttpTransport: GoogleHttpTransport = async (url, signal) => {
-	const response = await fetch(url, { method: "GET", signal: signal ?? null });
+export const defaultGeminiHttpTransport: GeminiHttpTransport = async (request, signal) => {
+	const response = await fetch(request.url, {
+		method: "POST",
+		headers: request.headers,
+		body: request.body,
+		signal: signal ?? null
+	});
 	const body = await response.text();
 	return { status: response.status, body };
 };
 
-/** The parsed, optional fields of a Google error body. */
-interface GoogleErrorDetail {
-	/** The provider-declared failure reason (for example `quotaExceeded`). */
+/** The parsed, optional fields of a Gemini error body. */
+interface GeminiErrorDetail {
+	/** The provider-declared gRPC status (for example `PERMISSION_DENIED`). */
+	status?: string;
+	/** The first `ErrorInfo.reason` from `error.details` (for example `API_KEY_SERVICE_BLOCKED`). */
 	reason?: string;
 	/** The provider's own error message text. */
 	message?: string;
 }
 
 /**
- * Parse a Google error body into its optional `reason` and `message`.
+ * Parse a Gemini error body into its optional `status`, `reason`, and
+ * `message`.
  *
  * The documented error shape is
  * `{ "error": { "code": <n>, "message": <string>, "status": <string>,
- * "errors": [ { "reason": <string>, "message": <string> } ] } }`.
+ * "details": [ { "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+ * "reason": <string>, "domain": <string> } ] } }`.
  * Parsing is defensive: a body that is not JSON, or that lacks the expected
  * fields, yields no detail — classification then falls back to the status
  * code alone. Never throws.
  */
-export function parseGoogleErrorDetail(body: string): GoogleErrorDetail {
+export function parseGeminiErrorDetail(body: string): GeminiErrorDetail {
 	let parsed: unknown;
 	try {
 		parsed = JSON.parse(body);
@@ -210,14 +232,18 @@ export function parseGoogleErrorDetail(body: string): GoogleErrorDetail {
 		return {};
 	}
 	const errorObj = error as Record<string, unknown>;
-	const detail: GoogleErrorDetail = {};
+	const detail: GeminiErrorDetail = {};
 	const message = errorObj["message"];
 	if (typeof message === "string" && message.trim().length > 0) {
 		detail.message = message.trim();
 	}
-	const errors = errorObj["errors"];
-	if (Array.isArray(errors)) {
-		for (const entry of errors) {
+	const status = errorObj["status"];
+	if (typeof status === "string" && status.trim().length > 0) {
+		detail.status = status.trim();
+	}
+	const details = errorObj["details"];
+	if (Array.isArray(details)) {
+		for (const entry of details) {
 			if (typeof entry === "object" && entry !== null && !Array.isArray(entry)) {
 				const reason = (entry as Record<string, unknown>)["reason"];
 				if (typeof reason === "string" && reason.trim().length > 0) {
@@ -231,30 +257,30 @@ export function parseGoogleErrorDetail(body: string): GoogleErrorDetail {
 }
 
 /**
- * Classify a non-2xx Google response into a failure class (see the module
+ * Classify a non-2xx Gemini response into a failure class (see the module
  * doc for the deterministic rules). The body is inspected only for the
- * documented `reason`/`message` fields; classification never depends on
- * parsing free text beyond the documented "API key not valid" error.
+ * documented `status`/`reason`/`message` fields; classification never
+ * depends on parsing free text beyond the documented "API key not valid"
+ * error.
  */
-export function classifyGoogleHttpError(status: number, body: string): GoogleSearchFailureClass {
-	const { reason, message } = parseGoogleErrorDetail(body);
+export function classifyGeminiHttpError(status: number, body: string): GoogleSearchFailureClass {
+	const { reason, message } = parseGeminiErrorDetail(body);
 
 	// Provider-declared reasons are the most specific signal.
 	switch (reason) {
-		case "quotaExceeded":
-		case "dailyLimitExceeded":
+		case "QUOTA_EXCEEDED":
 			return "quota";
-		case "rateLimitExceeded":
-		case "userRateLimitExceeded":
+		case "RESOURCE_EXHAUSTED":
 			return "rate_limit";
-		case "accessNotConfigured":
-			return "provider_failure";
 		default:
 			break;
 	}
 
 	// Status-based classification.
 	if (status === 401 || status === 403) {
+		// Covers PERMISSION_DENIED (incl. API_KEY_SERVICE_BLOCKED) and
+		// UNAUTHENTICATED: the credential (or the account behind it) is
+		// rejected.
 		return "invalid_credential";
 	}
 	if (status === 429) {
@@ -269,22 +295,25 @@ export function classifyGoogleHttpError(status: number, body: string): GoogleSea
 		}
 		return "invalid_request";
 	}
-	if (status >= 500) {
-		return "provider_failure";
-	}
+	// 404 (a model that is not available to this key) and everything else:
+	// the provider was reached and rejected the request for a reason that is
+	// not a credential, rate-limit, or malformed-input failure.
 	return "provider_failure";
 }
 
 /**
- * Build the human-readable message for a non-2xx Google response. Carries the
- * status, the provider's reason/message when present, and never the request
- * URL (which contains the credential) or the raw body.
+ * Build the human-readable message for a non-2xx Gemini response. Carries the
+ * status, the provider's status/reason when present, and the provider's own
+ * message — and never the request URL, the request header, or the raw body.
  */
-export function describeGoogleHttpError(status: number, body: string): string {
-	const { reason, message } = parseGoogleErrorDetail(body);
-	let text = `google search request failed with HTTP ${status}`;
+export function describeGeminiHttpError(status: number, body: string): string {
+	const { status: grpcStatus, reason, message } = parseGeminiErrorDetail(body);
+	let text = `gemini search request failed with HTTP ${status}`;
+	if (grpcStatus !== undefined) {
+		text += ` (status: ${grpcStatus})`;
+	}
 	if (reason !== undefined) {
-		text += ` (reason: ${reason})`;
+		text += `, reason: ${reason}`;
 	}
 	if (message !== undefined) {
 		text += `: ${truncate(message, 300)}`;
@@ -303,7 +332,7 @@ export function describeGoogleHttpError(status: number, body: string): string {
  * `TimeoutReason`, an *aborted* when it is an `AbortError`, and a
  * *provider_failure* for everything else (connection refused, DNS, TLS, …).
  */
-export function classifyGoogleFetchError(err: unknown, signal: AbortSignal | undefined): GoogleSearchFailureClass {
+export function classifyGeminiFetchError(err: unknown, signal: AbortSignal | undefined): GoogleSearchFailureClass {
 	if (signal?.aborted) {
 		return isTimeoutName(nameOf(signal.reason)) ? "timeout" : "aborted";
 	}
@@ -323,52 +352,52 @@ function isTimeoutName(name: string | undefined): boolean {
 }
 
 /**
- * Perform one Google search end to end: serialize the request, perform the
- * transport call, classify failures, and normalize a successful response onto
- * the seam result shape.
+ * Perform one Gemini grounding search end to end: serialize the request,
+ * perform the transport call, classify failures, and normalize a successful
+ * response onto the seam result shape.
  *
  * Every failure path throws a structured {@link WebError} (via
  * {@link mapGoogleSearchFailure}) — never a success-shaped result
  * (ENGINEERING.md §7):
  *
  *   - transport throw              → `ABORTED` / `TIMEOUT` / `PROVIDER_FAILURE`
- *   - non-2xx response             → per {@link classifyGoogleHttpError}
+ *   - non-2xx response             → per {@link classifyGeminiHttpError}
  *   - unparseable / unmappable 2xx → `MALFORMED_RESPONSE`
  *
  * (The `MISSING_CREDENTIAL` path is owned by the provider, which resolves
  * configuration per operation before calling this.)
  *
- * @param options - credential + query + optional `num`/`lr`/`gl`/`safe` (see above).
+ * @param options - credential + model + query (see above).
  * @param transport - the HTTP transport (injectable for tests).
  * @param signal - the caller's cancellation signal, forwarded to the transport.
  */
-export async function performGoogleSearch(
-	options: GoogleSearchRequestOptions,
-	transport: GoogleHttpTransport,
+export async function performGeminiSearch(
+	options: GeminiSearchRequestOptions,
+	transport: GeminiHttpTransport,
 	signal?: AbortSignal
 ): Promise<WebSearchResult> {
-	const url = buildGoogleSearchUrl(options);
+	const request = buildGeminiSearchRequest(options);
 
-	let response: GoogleHttpResponse;
+	let response: GeminiHttpResponse;
 	try {
-		response = await transport(url, signal);
+		response = await transport(request, signal);
 	} catch (err) {
-		const failureClass = classifyGoogleFetchError(err, signal);
+		const failureClass = classifyGeminiFetchError(err, signal);
 		const message =
 			failureClass === "aborted"
-				? "google search request was cancelled"
+				? "gemini search request was cancelled"
 				: failureClass === "timeout"
-					? "google search request timed out"
-					: `google search request failed: ${describeThrownError(err)}`;
+					? "gemini search request timed out"
+					: `gemini search request failed: ${describeThrownError(err)}`;
 		// Chain the credential-safe stand-in, never the raw transport error
-		// (see the module doc — the request URL carries the credential).
+		// (see the module doc — a transport may embed request details).
 		throw mapGoogleSearchFailure(failureClass, message, sanitizeTransportCause(err));
 	}
 
 	if (response.status < 200 || response.status >= 300) {
 		throw mapGoogleSearchFailure(
-			classifyGoogleHttpError(response.status, response.body),
-			describeGoogleHttpError(response.status, response.body)
+			classifyGeminiHttpError(response.status, response.body),
+			describeGeminiHttpError(response.status, response.body)
 		);
 	}
 
@@ -376,22 +405,22 @@ export async function performGoogleSearch(
 	try {
 		parsed = JSON.parse(response.body);
 	} catch (err) {
-		throw mapGoogleSearchFailure("malformed_response", "google search response is not valid JSON", err);
+		throw mapGoogleSearchFailure("malformed_response", "gemini search response is not valid JSON", err);
 	}
 	// Throws WebError(MALFORMED_RESPONSE) when the body cannot be mapped onto
 	// the seam shape (see normalize.ts for the rules).
-	return normalizeGoogleSearchResponse(parsed);
+	return normalizeGeminiSearchResponse(parsed);
 }
 
 /**
  * Build the credential-safe stand-in chained as `WebError.cause` for a
  * transport-level failure.
  *
- * The raw thrown error is deliberately **not** chained: the request URL
- * carries the API credential as a query parameter, and a production
- * transport (or a proxy in front of it) may embed the full request URL in
- * its error text — the cause is exactly what log serializers walk. The
- * stand-in preserves only what is safe and useful for diagnosis:
+ * The raw thrown error is deliberately **not** chained: a production
+ * transport (or a proxy in front of it) may embed request details — URL or
+ * header text — in its error message, and the cause is exactly what log
+ * serializers walk. The stand-in preserves only what is safe and useful for
+ * diagnosis:
  *
  *   - the failure's `name` (for example `TimeoutError`, `AbortError`) and
  *     its `code` (for example `ECONNREFUSED`, `ENOTFOUND`);
@@ -421,7 +450,9 @@ export function sanitizeTransportCause(err: unknown): Error {
  * Scrub URL tokens from text: replace any `http(s)://…` token (up to the
  * first whitespace or quote) and any `key=…` / `cx=…` query fragment with a
  * redaction marker, so a credential-bearing URL cannot survive into an
- * error message or a cause chain.
+ * error message or a cause chain. (Defense in depth: the adapter's own
+ * requests carry the credential in a header, but a proxy's error text is
+ * outside the adapter's control.)
  */
 export function scrubUrlTokens(text: string): string {
 	return text

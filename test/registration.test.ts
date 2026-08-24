@@ -29,7 +29,7 @@ import {
 	buildGoogleSearchProvider,
 	GOOGLE_SEARCH_PROVIDER_ID
 } from "../src/index.js";
-import { GOOGLE_SEARCH_API_KEY_ENV, GOOGLE_SEARCH_ENGINE_ID_ENV } from "../src/provider/config.js";
+import { GEMINI_API_KEY_ENV } from "../src/provider/config.js";
 
 /**
  * Make the process environment hermetic for the duration of this file:
@@ -37,7 +37,7 @@ import { GOOGLE_SEARCH_API_KEY_ENV, GOOGLE_SEARCH_ENGINE_ID_ENV } from "../src/p
  * developer's shell happened to set) so the plugin's provider is
  * deterministically *unconfigured*. Restored after the file finishes.
  */
-const CONFIG_ENV_KEYS = [GOOGLE_SEARCH_API_KEY_ENV, GOOGLE_SEARCH_ENGINE_ID_ENV] as const;
+const CONFIG_ENV_KEYS = [GEMINI_API_KEY_ENV] as const;
 const savedEnv: Record<string, string | undefined> = {};
 for (const key of CONFIG_ENV_KEYS) {
 	savedEnv[key] = process.env[key];
@@ -156,8 +156,7 @@ test("the unconfigured provider is unavailable and fails structured (no network)
 			assert.ok(err instanceof WebError, `expected WebError, got: ${String(err)}`);
 			const webError = err as WebError;
 			assert.equal(webError.code, "MISSING_CREDENTIAL");
-			assert.match(webError.message, /GOOGLE_SEARCH_API_KEY/);
-			assert.match(webError.message, /GOOGLE_SEARCH_ENGINE_ID/);
+			assert.match(webError.message, /GEMINI_API_KEY/);
 			return true;
 		}
 	);

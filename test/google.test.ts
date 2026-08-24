@@ -1,5 +1,6 @@
 /**
- * Issue #4 acceptance tests — the real Google search backend adapter.
+ * Issue #4/#7 acceptance tests — the real Google search backend adapter
+ * (Gemini `google_search` grounding, post-migration).
  *
  * Everything here is **offline**: the HTTP transport is injected as a mock
  * that returns recorded fixtures, the runtime configuration comes from an
@@ -10,14 +11,14 @@
  *
  * Coverage against the acceptance criteria:
  *   1. request serialization  — the seam request is serialized into the
- *      documented Custom Search JSON API request (endpoint, `key`, `cx`,
- *      `q`, `num`);
- *   2. normalization          — Google results normalize onto the provider-
- *      neutral seam types without leaking wire DTOs (`link` etc. stay in the
- *      adapter);
- *   3. empty results          — `items: []` AND a response that omits
- *      `items` entirely (Google's real zero-result wire shape) are valid
- *      zero-source results; a *present* non-array `items` is malformed;
+ *      documented Gemini grounding request (endpoint + model path,
+ *      `x-goog-api-key` header, prompt + `google_search` tool body);
+ *   2. normalization          — Gemini results normalize onto the
+ *      provider-neutral seam types without leaking wire DTOs (`uri` etc.
+ *      stay in the adapter);
+ *   3. empty results          — a 200 response without `groundingMetadata`
+ *      (Gemini's real zero-result wire shape) is a valid zero-source result;
+ *      a *present* non-array `groundingChunks` is malformed;
  *   4. stable failure paths   — auth/config, quota/rate-limit,
  *      timeout/cancel, provider error, and malformed response each have a
  *      stable, structured `WebError` code;
@@ -36,23 +37,23 @@ import { fileURLToPath } from "node:url";
 import { WebError, type WebSearchResult } from "@deepseek-ai/dsh-web";
 
 import { buildGoogleSearchProvider, GOOGLE_SEARCH_PROVIDER_ID } from "../src/index.js";
+import { GEMINI_API_KEY_ENV, resolveGoogleSearchConfig } from "../src/provider/config.js";
 import {
-	GOOGLE_SEARCH_API_KEY_ENV,
-	GOOGLE_SEARCH_ENGINE_ID_ENV,
-	resolveGoogleSearchConfig
-} from "../src/provider/config.js";
-import {
-	GOOGLE_SEARCH_ENDPOINT,
-	GOOGLE_SEARCH_MAX_RESULTS_PER_REQUEST,
-	buildGoogleSearchUrl,
-	classifyGoogleFetchError,
-	classifyGoogleHttpError,
-	googleNumForMaxResults,
-	parseGoogleErrorDetail,
+	GEMINI_API_KEY_HEADER,
+	GEMINI_SEARCH_DEFAULT_MODEL,
+	GEMINI_SEARCH_ENDPOINT_BASE,
+	GEMINI_SEARCH_PROMPT_TEMPLATE,
+	buildGeminiSearchPrompt,
+	buildGeminiSearchRequest,
+	buildGeminiSearchUrl,
+	classifyGeminiFetchError,
+	classifyGeminiHttpError,
+	parseGeminiErrorDetail,
 	sanitizeTransportCause,
 	scrubUrlTokens,
-	type GoogleHttpTransport,
-	type GoogleHttpResponse
+	type GeminiHttpTransport,
+	type GeminiHttpResponse,
+	type GeminiSearchHttpRequest
 } from "../src/provider/transport.js";
 
 // ---------------------------------------------------------------------------
@@ -60,52 +61,53 @@ import {
 // ---------------------------------------------------------------------------
 
 const FAKE_API_KEY = "fake-api-key-000";
-const FAKE_CX = "fake-cx-000";
 
 const CONFIGURED_ENV: Record<string, string | undefined> = {
-	[GOOGLE_SEARCH_API_KEY_ENV]: FAKE_API_KEY,
-	[GOOGLE_SEARCH_ENGINE_ID_ENV]: FAKE_CX
+	[GEMINI_API_KEY_ENV]: FAKE_API_KEY
 };
 
 const SUCCESS_BODY = JSON.stringify({
-	kind: "customsearch#search",
-	queries: {
-		request: [{ title: "Google Search", totalResults: "2", searchTerms: "deepseek harness" }]
-	},
-	items: [
+	candidates: [
 		{
-			kind: "customsearch#result",
-			title: "DeepSeek Harness",
-			link: "https://example.com/dsh",
-			snippet: "The DeepSeek Harness."
-		},
-		{
-			kind: "customsearch#result",
-			title: "Second result",
-			link: "https://example.com/second"
+			content: { parts: [{ text: "DeepSeek Harness is an open-source agent execution framework." }] },
+			finishReason: "STOP",
+			groundingMetadata: {
+				groundingChunks: [
+					{ web: { uri: "https://example.com/dsh", title: "github.com" } },
+					{ web: { uri: "https://example.com/second", title: "wikipedia.org" } }
+				],
+				webSearchQueries: ["deepseek harness"]
+			}
 		}
 	]
 });
 
-const EMPTY_ITEMS_BODY = JSON.stringify({
-	kind: "customsearch#search",
-	items: []
+const EMPTY_GROUNDING_BODY = JSON.stringify({
+	candidates: [
+		{
+			content: { parts: [{ text: "A web search yielded no results." }] },
+			finishReason: "STOP"
+		}
+	]
 });
 
 /** A mock transport that records calls and replies from a handler. */
 function makeTransport(
-	handler: (url: string, signal?: AbortSignal) => GoogleHttpResponse | Promise<GoogleHttpResponse>
+	handler: (
+		request: GeminiSearchHttpRequest,
+		signal?: AbortSignal
+	) => GeminiHttpResponse | Promise<GeminiHttpResponse>
 ) {
-	const calls: { url: string; signal?: AbortSignal | undefined }[] = [];
-	const transport: GoogleHttpTransport = async (url, signal) => {
-		calls.push({ url, signal });
-		return handler(url, signal);
+	const calls: { request: GeminiSearchHttpRequest; signal?: AbortSignal | undefined }[] = [];
+	const transport: GeminiHttpTransport = async (request, signal) => {
+		calls.push({ request, signal });
+		return handler(request, signal);
 	};
 	return { transport, calls };
 }
 
 /** Build a provider with the configured fake env and the given transport. */
-function configuredProvider(transport: GoogleHttpTransport) {
+function configuredProvider(transport: GeminiHttpTransport) {
 	return buildGoogleSearchProvider({ env: CONFIGURED_ENV, transport });
 }
 
@@ -126,31 +128,24 @@ async function expectWebError(promise: Promise<unknown>, code: string): Promise<
 	assert.fail(`expected a WebError with code ${code}, but the promise resolved`);
 }
 
-/** Parse a captured request URL into its origin+path and query parameters. */
-function parsedUrl(url: string): { originPath: string; params: URLSearchParams } {
-	const u = new URL(url);
-	return { originPath: `${u.origin}${u.pathname}`, params: u.searchParams };
+/** Parse the JSON body of a captured request. */
+function parsedBody(request: GeminiSearchHttpRequest): Record<string, unknown> {
+	return JSON.parse(request.body) as Record<string, unknown>;
 }
 
 // ---------------------------------------------------------------------------
 // Configuration (acceptance 4: authentication/configuration path)
 // ---------------------------------------------------------------------------
 
-test("resolveGoogleSearchConfig: both values present and non-blank → config", () => {
+test("resolveGoogleSearchConfig: the credential present and non-blank → config", () => {
 	const { config, missing } = resolveGoogleSearchConfig(CONFIGURED_ENV);
 	assert.deepEqual(missing, []);
-	assert.deepEqual(config, { apiKey: FAKE_API_KEY, cx: FAKE_CX });
+	assert.deepEqual(config, { apiKey: FAKE_API_KEY });
 });
 
-test("resolveGoogleSearchConfig: absent or blank values are missing (names, never values)", () => {
-	assert.deepEqual(resolveGoogleSearchConfig({}).missing, [GOOGLE_SEARCH_API_KEY_ENV, GOOGLE_SEARCH_ENGINE_ID_ENV]);
-	assert.deepEqual(resolveGoogleSearchConfig({ [GOOGLE_SEARCH_API_KEY_ENV]: FAKE_API_KEY }).missing, [
-		GOOGLE_SEARCH_ENGINE_ID_ENV
-	]);
-	assert.deepEqual(
-		resolveGoogleSearchConfig({ [GOOGLE_SEARCH_API_KEY_ENV]: "   ", [GOOGLE_SEARCH_ENGINE_ID_ENV]: FAKE_CX }).missing,
-		[GOOGLE_SEARCH_API_KEY_ENV]
-	);
+test("resolveGoogleSearchConfig: an absent or blank value is missing (names, never values)", () => {
+	assert.deepEqual(resolveGoogleSearchConfig({}).missing, [GEMINI_API_KEY_ENV]);
+	assert.deepEqual(resolveGoogleSearchConfig({ [GEMINI_API_KEY_ENV]: "   " }).missing, [GEMINI_API_KEY_ENV]);
 });
 
 test("available() is a cheap local config check — no transport, no network", () => {
@@ -158,22 +153,21 @@ test("available() is a cheap local config check — no transport, no network", (
 	const unconfigured = buildGoogleSearchProvider({ env: {}, transport });
 	const configured = configuredProvider(transport);
 
-	assert.equal(unconfigured.available(), false, "missing both values → unavailable");
-	assert.equal(buildGoogleSearchProvider({ env: { [GOOGLE_SEARCH_API_KEY_ENV]: FAKE_API_KEY }, transport }).available(), false, "missing one value → unavailable");
-	assert.equal(buildGoogleSearchProvider({ env: { [GOOGLE_SEARCH_API_KEY_ENV]: "  " }, transport }).available(), false, "blank value → unavailable");
-	assert.equal(configured.available(), true, "both values present → available");
+	assert.equal(unconfigured.available(), false, "missing the credential → unavailable");
+	assert.equal(
+		buildGoogleSearchProvider({ env: { [GEMINI_API_KEY_ENV]: "  " }, transport }).available(),
+		false,
+		"blank value → unavailable"
+	);
+	assert.equal(configured.available(), true, "the credential present → available");
 });
 
 test("search() with missing configuration fails MISSING_CREDENTIAL without any request", async () => {
 	const { transport, calls } = makeTransport(() => ({ status: 200, body: SUCCESS_BODY }));
 	const provider = buildGoogleSearchProvider({ env: {}, transport });
 
-	const err = await expectWebError(
-		provider.search({ query: "deepseek harness" }),
-		"MISSING_CREDENTIAL"
-	);
-	assert.match(err.message, new RegExp(GOOGLE_SEARCH_API_KEY_ENV));
-	assert.match(err.message, new RegExp(GOOGLE_SEARCH_ENGINE_ID_ENV));
+	const err = await expectWebError(provider.search({ query: "deepseek harness" }), "MISSING_CREDENTIAL");
+	assert.match(err.message, new RegExp(GEMINI_API_KEY_ENV));
 	assert.equal(calls.length, 0, "no transport call while unconfigured");
 });
 
@@ -181,44 +175,55 @@ test("search() with missing configuration fails MISSING_CREDENTIAL without any r
 // Request serialization (acceptance 1)
 // ---------------------------------------------------------------------------
 
-test("buildGoogleSearchUrl serializes the documented request shape", () => {
-	const url = buildGoogleSearchUrl({ apiKey: FAKE_API_KEY, cx: FAKE_CX, query: "deepseek harness" });
-	const { originPath, params } = parsedUrl(url);
-	assert.equal(originPath, GOOGLE_SEARCH_ENDPOINT);
-	assert.equal(params.get("key"), FAKE_API_KEY);
-	assert.equal(params.get("cx"), FAKE_CX);
-	assert.equal(params.get("q"), "deepseek harness");
-	assert.equal(params.has("num"), false, "num is omitted when no bound is given");
+test("buildGeminiSearchUrl serializes the documented model path", () => {
+	const url = buildGeminiSearchUrl(GEMINI_SEARCH_DEFAULT_MODEL);
+	const u = new URL(url);
+	assert.equal(`${u.origin}${u.pathname}`, `${GEMINI_SEARCH_ENDPOINT_BASE}/${GEMINI_SEARCH_DEFAULT_MODEL}:generateContent`);
+	assert.equal(u.search, "", "the URL carries no query string (no credential, no parameters)");
 });
 
-test("buildGoogleSearchUrl percent-encodes special characters in the query", () => {
-	const query = "a b & c = d?\"e\"";
-	const url = buildGoogleSearchUrl({ apiKey: FAKE_API_KEY, cx: FAKE_CX, query });
-	assert.equal(parsedUrl(url).params.get("q"), query, "the query round-trips through encoding");
+test("buildGeminiSearchUrl rejects a blank or path-injecting model name", () => {
+	assert.throws(() => buildGeminiSearchUrl("   "), RangeError);
+	assert.throws(() => buildGeminiSearchUrl("a/b"), RangeError, "a '/' would inject a path segment");
+	assert.throws(() => buildGeminiSearchUrl("a:b"), RangeError, "a ':' would break the method suffix");
 });
 
-test("buildGoogleSearchUrl rejects an out-of-range num (no silent clamp)", () => {
-	assert.throws(
-		() => buildGoogleSearchUrl({ apiKey: FAKE_API_KEY, cx: FAKE_CX, query: "q", num: 0 }),
-		RangeError
-	);
-	assert.throws(
-		() => buildGoogleSearchUrl({ apiKey: FAKE_API_KEY, cx: FAKE_CX, query: "q", num: 11 }),
-		RangeError
-	);
-	assert.throws(
-		() => buildGoogleSearchUrl({ apiKey: FAKE_API_KEY, cx: FAKE_CX, query: "q", num: 2.5 }),
-		RangeError
+test("buildGeminiSearchPrompt wraps the query in the fixed instruction", () => {
+	assert.equal(
+		buildGeminiSearchPrompt("deepseek harness"),
+		`${GEMINI_SEARCH_PROMPT_TEMPLATE}deepseek harness`
 	);
 });
 
-test("googleNumForMaxResults maps the seam bound onto the API's num (1..10)", () => {
-	assert.equal(googleNumForMaxResults(undefined), undefined);
-	assert.equal(googleNumForMaxResults(0), undefined, "a bound below 1 is omitted (the seam truncates anyway)");
-	assert.equal(googleNumForMaxResults(5), 5);
-	assert.equal(googleNumForMaxResults(10), 10);
-	assert.equal(googleNumForMaxResults(50), GOOGLE_SEARCH_MAX_RESULTS_PER_REQUEST, "bounds above the API max clamp down");
-	assert.equal(googleNumForMaxResults(3.7), 3, "fractional bounds floor to an integer");
+test("buildGeminiSearchRequest serializes the documented request shape", () => {
+	const request = buildGeminiSearchRequest({
+		apiKey: FAKE_API_KEY,
+		model: GEMINI_SEARCH_DEFAULT_MODEL,
+		query: "deepseek harness"
+	});
+	// The credential travels in the header, never the URL.
+	assert.equal(request.headers[GEMINI_API_KEY_HEADER], FAKE_API_KEY);
+	assert.equal(request.headers["Content-Type"], "application/json");
+	assert.ok(!request.url.includes(FAKE_API_KEY), "the URL must not carry the credential");
+	assert.ok(!request.body.includes(FAKE_API_KEY), "the body must not carry the credential");
+
+	const body = parsedBody(request);
+	assert.deepEqual(body["tools"], [{ google_search: {} }], "the google_search tool is attached");
+	const contents = body["contents"] as { role: string; parts: { text: string }[] }[];
+	assert.equal(contents[0]?.role, "user");
+	assert.equal(contents[0]?.parts?.[0]?.text, `${GEMINI_SEARCH_PROMPT_TEMPLATE}deepseek harness`);
+});
+
+test("buildGeminiSearchRequest percent-encodes special characters in the query", () => {
+	const query = 'a b & c = d?"e"';
+	const request = buildGeminiSearchRequest({
+		apiKey: FAKE_API_KEY,
+		model: GEMINI_SEARCH_DEFAULT_MODEL,
+		query
+	});
+	const body = parsedBody(request);
+	const contents = body["contents"] as { parts: { text: string }[] }[];
+	assert.equal(contents[0]?.parts?.[0]?.text, `${GEMINI_SEARCH_PROMPT_TEMPLATE}${query}`, "the query round-trips through JSON");
 });
 
 test("search() sends the documented request for a seam request", async () => {
@@ -227,56 +232,56 @@ test("search() sends the documented request for a seam request", async () => {
 
 	await provider.search({ query: "deepseek harness" });
 	assert.equal(calls.length, 1);
-	const { originPath, params } = parsedUrl(calls[0]!.url);
-	assert.equal(originPath, GOOGLE_SEARCH_ENDPOINT);
-	assert.equal(params.get("key"), FAKE_API_KEY);
-	assert.equal(params.get("cx"), FAKE_CX);
-	assert.equal(params.get("q"), "deepseek harness");
-	// Issue #6: the configured maxResults default (10) is applied at the
-	// request layer as num (the API's own default, made explicit by config).
-	assert.equal(params.get("num"), "10");
+	const call = calls[0]!;
+	assert.equal(call.request.url, `${GEMINI_SEARCH_ENDPOINT_BASE}/${GEMINI_SEARCH_DEFAULT_MODEL}:generateContent`);
+	assert.equal(call.request.headers[GEMINI_API_KEY_HEADER], FAKE_API_KEY);
+	const body = parsedBody(call.request);
+	const contents = body["contents"] as { parts: { text: string }[] }[];
+	assert.equal(contents[0]?.parts?.[0]?.text, `${GEMINI_SEARCH_PROMPT_TEMPLATE}deepseek harness`);
+	assert.deepEqual(body["tools"], [{ google_search: {} }]);
+	// The grounding API has no per-request result-count control: maxResults is
+	// enforced by the seam on the way back, never sent in the request.
+	assert.equal(body["num"], undefined, "no result-count parameter exists in the grounding API");
 });
 
-test("search() applies maxResults at the request layer as num (clamped to 1..10)", async () => {
+test("search() uses the configured model from the settings section", async () => {
 	const { transport, calls } = makeTransport(() => ({ status: 200, body: SUCCESS_BODY }));
-	const provider = configuredProvider(transport);
+	const provider = buildGoogleSearchProvider({
+		env: CONFIGURED_ENV,
+		transport,
+		settings: { apiKeyEnv: GEMINI_API_KEY_ENV, model: "gemini-3.5-flash", requestTimeoutMs: 30_000 }
+	});
 
-	await provider.search({ query: "q", maxResults: 5 });
-	assert.equal(parsedUrl(calls[0]!.url).params.get("num"), "5");
-
-	await provider.search({ query: "q", maxResults: 50 });
-	assert.equal(parsedUrl(calls[1]!.url).params.get("num"), "10");
-
-	await provider.search({ query: "q", maxResults: 0 });
-	assert.equal(parsedUrl(calls[2]!.url).params.has("num"), false);
+	await provider.search({ query: "q" });
+	assert.equal(calls[0]!.request.url, `${GEMINI_SEARCH_ENDPOINT_BASE}/gemini-3.5-flash:generateContent`);
 });
 
 // ---------------------------------------------------------------------------
 // Response normalization (acceptance 2)
 // ---------------------------------------------------------------------------
 
-test("search() normalizes Google results onto the seam types without leaking wire DTOs", async () => {
+test("search() normalizes Gemini results onto the seam types without leaking wire DTOs", async () => {
 	const { transport } = makeTransport(() => ({ status: 200, body: SUCCESS_BODY }));
 	const provider = configuredProvider(transport);
 
 	const result: WebSearchResult = await provider.search({ query: "deepseek harness" });
 
-	// Seam shape: sources array, truncated flag, no invented content.
+	// Seam shape: sources array, truncated flag, the provider answer as content.
 	assert.equal(result.truncated, false, "the adapter never truncates; the seam owns that");
-	assert.equal(result.content, undefined, "Google provides no aggregate content — never invented");
+	assert.equal(result.content, "DeepSeek Harness is an open-source agent execution framework.");
 	assert.equal(result.sources.length, 2, "result order is preserved");
 
 	const [first, second] = result.sources;
-	assert.equal(first?.url, "https://example.com/dsh", "link → url");
-	assert.equal(first?.title, "DeepSeek Harness");
-	assert.equal(first?.snippet, "The DeepSeek Harness.");
+	assert.equal(first?.url, "https://example.com/dsh", "web.uri → url");
+	assert.equal(first?.title, "github.com", "web.title → title");
 	assert.equal(second?.url, "https://example.com/second");
-	assert.equal(second?.title, "Second result");
-	assert.equal(second?.snippet, undefined, "an omitted snippet stays absent (not '')");
+	assert.equal(second?.title, "wikipedia.org");
+	assert.equal(second?.snippet, undefined, "the grounding response supplies no snippet — stays absent");
 
 	// No wire DTO field may leak onto the seam source shape.
 	for (const source of result.sources) {
-		assert.equal((source as unknown as Record<string, unknown>)["link"], undefined, "the 'link' wire field must not leak");
+		assert.equal((source as unknown as Record<string, unknown>)["uri"], undefined, "the 'uri' wire field must not leak");
+		assert.equal((source as unknown as Record<string, unknown>)["web"], undefined, "the 'web' wire field must not leak");
 		assert.equal((source as unknown as Record<string, unknown>)["publishedAt"], undefined, "publishedAt is never synthesized");
 	}
 });
@@ -285,24 +290,23 @@ test("search() normalizes Google results onto the seam types without leaking wir
 // Empty results (acceptance 3)
 // ---------------------------------------------------------------------------
 
-test("an empty items array is a valid zero-source result, not an error", async () => {
-	const { transport } = makeTransport(() => ({ status: 200, body: EMPTY_ITEMS_BODY }));
+test("a 200 response without groundingMetadata is a valid zero-source result (Gemini's real no-result shape)", async () => {
+	const { transport } = makeTransport(() => ({ status: 200, body: EMPTY_GROUNDING_BODY }));
 	const provider = configuredProvider(transport);
 
 	const result = await provider.search({ query: "nothing matches this" });
 	assert.equal(result.sources.length, 0);
+	assert.equal(result.content, "A web search yielded no results.", "the answer text still maps");
 	assert.equal(result.truncated, false);
 });
 
-test("a 200 response that omits the items field entirely is a valid zero-source result (review case)", async () => {
-	// Google omits the optional `items` field when there are no results —
-	// absent is a fact (no results), not a malformed concrete value.
+test("a 200 response with an empty groundingChunks array is a valid zero-source result", async () => {
 	const { transport } = makeTransport(() => ({
 		status: 200,
 		body: JSON.stringify({
-			kind: "customsearch#search",
-			queries: { request: [{ title: "Google Search", totalResults: "0", searchTerms: "zzz" }] },
-			searchInformation: { totalResults: "0" }
+			candidates: [
+				{ content: { parts: [{ text: "No results." }] }, groundingMetadata: { groundingChunks: [] } }
+			]
 		})
 	}));
 	const provider = configuredProvider(transport);
@@ -312,8 +316,11 @@ test("a 200 response that omits the items field entirely is a valid zero-source 
 	assert.equal(result.truncated, false);
 });
 
-test("a 200 response with a present non-array items field is MALFORMED_RESPONSE (review case)", async () => {
-	const { transport } = makeTransport(() => ({ status: 200, body: JSON.stringify({ items: "invalid" }) }));
+test("a 200 response with a present non-array groundingChunks field is MALFORMED_RESPONSE (review case)", async () => {
+	const { transport } = makeTransport(() => ({
+		status: 200,
+		body: JSON.stringify({ candidates: [{ content: { parts: [{ text: "A." }] }, groundingMetadata: { groundingChunks: "invalid" } }] })
+	}));
 	const provider = configuredProvider(transport);
 	await expectWebError(provider.search({ query: "deepseek harness" }), "MALFORMED_RESPONSE");
 });
@@ -322,89 +329,88 @@ test("a 200 response with a present non-array items field is MALFORMED_RESPONSE 
 // Failure paths (acceptance 4)
 // ---------------------------------------------------------------------------
 
-test("classifyGoogleHttpError: deterministic status/reason classification", () => {
+test("classifyGeminiHttpError: deterministic status/reason classification", () => {
 	const quotaBody = JSON.stringify({
 		error: {
-			code: 403,
-			message: "Daily Limit Exceeded",
-			status: "PERMISSION_DENIED",
-			errors: [{ reason: "quotaExceeded", message: "Daily Limit Exceeded" }]
+			code: 429,
+			message: "Quota exceeded for quota metric 'GenerateContent'",
+			status: "RESOURCE_EXHAUSTED",
+			details: [{ "@type": "type.googleapis.com/google.rpc.ErrorInfo", reason: "QUOTA_EXCEEDED", domain: "googleapis.com" }]
 		}
 	});
 	const rateBody = JSON.stringify({
 		error: {
 			code: 429,
-			message: "Rate Limit Exceeded",
+			message: "Resource has been exhausted (e.g. check quota).",
 			status: "RESOURCE_EXHAUSTED",
-			errors: [{ reason: "rateLimitExceeded", message: "Rate Limit Exceeded" }]
+			details: [{ "@type": "type.googleapis.com/google.rpc.ErrorInfo", reason: "RESOURCE_EXHAUSTED", domain: "googleapis.com" }]
 		}
 	});
-	const accessBody = JSON.stringify({
+	const blockedKeyBody = JSON.stringify({
 		error: {
 			code: 403,
-			message: "Access Not Configured",
+			message: "Requests to this API are blocked.",
 			status: "PERMISSION_DENIED",
-			errors: [{ reason: "accessNotConfigured", message: "Access Not Configured" }]
+			details: [{ "@type": "type.googleapis.com/google.rpc.ErrorInfo", reason: "API_KEY_SERVICE_BLOCKED", domain: "googleapis.com" }]
 		}
 	});
 	const badKeyBody = JSON.stringify({
-		error: {
-			code: 400,
-			message: "API key not valid. Please pass a valid API key.",
-			status: "INVALID_ARGUMENT"
-		}
+		error: { code: 400, message: "API key not valid. Please pass a valid API key.", status: "INVALID_ARGUMENT" }
 	});
 	const badQueryBody = JSON.stringify({
+		error: { code: 400, message: "Invalid value at 'contents'", status: "INVALID_ARGUMENT" }
+	});
+	const modelBody = JSON.stringify({
 		error: {
-			code: 400,
-			message: "Invalid value at 'q'",
-			status: "INVALID_ARGUMENT"
+			code: 404,
+			message: "This model models/gemini-2.5-flash is no longer available to new users.",
+			status: "NOT_FOUND"
 		}
 	});
 
-	assert.equal(classifyGoogleHttpError(403, quotaBody), "quota", "reason quotaExceeded → quota");
-	assert.equal(classifyGoogleHttpError(403, JSON.stringify({ error: { errors: [{ reason: "dailyLimitExceeded" }] } })), "quota");
-	assert.equal(classifyGoogleHttpError(429, rateBody), "rate_limit", "reason rateLimitExceeded → rate_limit");
-	assert.equal(classifyGoogleHttpError(429, "{}"), "rate_limit", "HTTP 429 → rate_limit without a reason");
-	assert.equal(classifyGoogleHttpError(403, accessBody), "provider_failure", "accessNotConfigured is not a credential failure");
-	assert.equal(classifyGoogleHttpError(403, "{}"), "invalid_credential", "HTTP 403 → invalid_credential");
-	assert.equal(classifyGoogleHttpError(401, "{}"), "invalid_credential", "HTTP 401 → invalid_credential");
-	assert.equal(classifyGoogleHttpError(400, badKeyBody), "invalid_credential", "the documented invalid-key 400 is an auth failure");
-	assert.equal(classifyGoogleHttpError(400, badQueryBody), "invalid_request", "other 400s are invalid requests");
-	assert.equal(classifyGoogleHttpError(500, "{}"), "provider_failure", "HTTP 5xx → provider_failure");
-	assert.equal(classifyGoogleHttpError(404, "{}"), "provider_failure", "other non-2xx → provider_failure");
-	assert.equal(classifyGoogleHttpError(403, "not json at all"), "invalid_credential", "unparseable body falls back to the status");
+	assert.equal(classifyGeminiHttpError(429, quotaBody), "quota", "reason QUOTA_EXCEEDED → quota");
+	assert.equal(classifyGeminiHttpError(429, rateBody), "rate_limit", "reason RESOURCE_EXHAUSTED → rate_limit");
+	assert.equal(classifyGeminiHttpError(429, "{}"), "rate_limit", "HTTP 429 → rate_limit without a reason");
+	assert.equal(classifyGeminiHttpError(403, blockedKeyBody), "invalid_credential", "API_KEY_SERVICE_BLOCKED is a credential/account failure");
+	assert.equal(classifyGeminiHttpError(403, "{}"), "invalid_credential", "HTTP 403 → invalid_credential");
+	assert.equal(classifyGeminiHttpError(401, "{}"), "invalid_credential", "HTTP 401 → invalid_credential");
+	assert.equal(classifyGeminiHttpError(400, badKeyBody), "invalid_credential", "the documented invalid-key 400 is an auth failure");
+	assert.equal(classifyGeminiHttpError(400, badQueryBody), "invalid_request", "other 400s are invalid requests");
+	assert.equal(classifyGeminiHttpError(404, modelBody), "provider_failure", "a model that is not available is a provider failure");
+	assert.equal(classifyGeminiHttpError(500, "{}"), "provider_failure", "HTTP 5xx → provider_failure");
+	assert.equal(classifyGeminiHttpError(403, "not json at all"), "invalid_credential", "unparseable body falls back to the status");
 });
 
-test("parseGoogleErrorDetail: defensive parsing of the documented error shape", () => {
-	const detail = parseGoogleErrorDetail(
+test("parseGeminiErrorDetail: defensive parsing of the documented error shape", () => {
+	const detail = parseGeminiErrorDetail(
 		JSON.stringify({
 			error: {
 				code: 403,
-				message: "  Daily Limit Exceeded  ",
+				message: "  Requests blocked  ",
 				status: "PERMISSION_DENIED",
-				errors: [{ reason: "quotaExceeded", message: "Daily Limit Exceeded" }]
+				details: [{ "@type": "type.googleapis.com/google.rpc.ErrorInfo", reason: "API_KEY_SERVICE_BLOCKED" }]
 			}
 		})
 	);
-	assert.equal(detail.reason, "quotaExceeded");
-	assert.equal(detail.message, "Daily Limit Exceeded", "message is trimmed");
+	assert.equal(detail.reason, "API_KEY_SERVICE_BLOCKED");
+	assert.equal(detail.status, "PERMISSION_DENIED");
+	assert.equal(detail.message, "Requests blocked", "message is trimmed");
 
-	assert.deepEqual(parseGoogleErrorDetail("not json"), {}, "non-JSON body → no detail");
-	assert.deepEqual(parseGoogleErrorDetail(JSON.stringify([1, 2])), {}, "non-object body → no detail");
-	assert.deepEqual(parseGoogleErrorDetail(JSON.stringify({ ok: true })), {}, "missing error object → no detail");
+	assert.deepEqual(parseGeminiErrorDetail("not json"), {}, "non-JSON body → no detail");
+	assert.deepEqual(parseGeminiErrorDetail(JSON.stringify([1, 2])), {}, "non-object body → no detail");
+	assert.deepEqual(parseGeminiErrorDetail(JSON.stringify({ ok: true })), {}, "missing error object → no detail");
 });
 
 test("search() maps non-2xx responses to stable WebError codes (no credential leak)", async () => {
 	const cases: Array<{ status: number; body: string; code: string }> = [
-		{ status: 401, body: JSON.stringify({ error: { code: 401, message: "Request had insufficient authentication scope." } }), code: "INVALID_CREDENTIAL" },
-		{ status: 403, body: JSON.stringify({ error: { code: 403, message: "Request denied" } }), code: "INVALID_CREDENTIAL" },
-		{ status: 429, body: JSON.stringify({ error: { code: 429, message: "Rate Limit Exceeded", errors: [{ reason: "rateLimitExceeded" }] } }), code: "RATE_LIMIT" },
-		{ status: 403, body: JSON.stringify({ error: { code: 403, message: "Daily Limit Exceeded", errors: [{ reason: "quotaExceeded" }] } }), code: "QUOTA" },
-		{ status: 403, body: JSON.stringify({ error: { code: 403, message: "Access Not Configured", errors: [{ reason: "accessNotConfigured" }] } }), code: "PROVIDER_FAILURE" },
-		{ status: 400, body: JSON.stringify({ error: { code: 400, message: "API key not valid. Please pass a valid API key." } }), code: "INVALID_CREDENTIAL" },
-		{ status: 400, body: JSON.stringify({ error: { code: 400, message: "Invalid value at 'q'" } }), code: "INVALID_REQUEST" },
-		{ status: 500, body: JSON.stringify({ error: { code: 500, message: "Internal error" } }), code: "PROVIDER_FAILURE" }
+		{ status: 401, body: JSON.stringify({ error: { code: 401, message: "Request had insufficient authentication scope.", status: "UNAUTHENTICATED" } }), code: "INVALID_CREDENTIAL" },
+		{ status: 403, body: JSON.stringify({ error: { code: 403, message: "Request denied", status: "PERMISSION_DENIED" } }), code: "INVALID_CREDENTIAL" },
+		{ status: 429, body: JSON.stringify({ error: { code: 429, message: "Rate limited", status: "RESOURCE_EXHAUSTED", details: [{ reason: "RESOURCE_EXHAUSTED" }] } }), code: "RATE_LIMIT" },
+		{ status: 429, body: JSON.stringify({ error: { code: 429, message: "Quota exceeded", status: "RESOURCE_EXHAUSTED", details: [{ reason: "QUOTA_EXCEEDED" }] } }), code: "QUOTA" },
+		{ status: 400, body: JSON.stringify({ error: { code: 400, message: "API key not valid. Please pass a valid API key.", status: "INVALID_ARGUMENT" } }), code: "INVALID_CREDENTIAL" },
+		{ status: 400, body: JSON.stringify({ error: { code: 400, message: "Invalid value at 'contents'", status: "INVALID_ARGUMENT" } }), code: "INVALID_REQUEST" },
+		{ status: 404, body: JSON.stringify({ error: { code: 404, message: "Model not available", status: "NOT_FOUND" } }), code: "PROVIDER_FAILURE" },
+		{ status: 500, body: JSON.stringify({ error: { code: 500, message: "Internal error", status: "INTERNAL" } }), code: "PROVIDER_FAILURE" }
 	];
 
 	for (const { status, body, code } of cases) {
@@ -422,8 +428,11 @@ test("search() maps a 2xx body that is not JSON to MALFORMED_RESPONSE", async ()
 	await expectWebError(provider.search({ query: "deepseek harness" }), "MALFORMED_RESPONSE");
 });
 
-test("search() maps a 2xx body with a present non-array items field to MALFORMED_RESPONSE", async () => {
-	const { transport } = makeTransport(() => ({ status: 200, body: JSON.stringify({ kind: "customsearch#search", items: 42 }) }));
+test("search() maps a 2xx body with a present non-array groundingChunks field to MALFORMED_RESPONSE", async () => {
+	const { transport } = makeTransport(() => ({
+		status: 200,
+		body: JSON.stringify({ candidates: [{ content: { parts: [{ text: "A." }] }, groundingMetadata: { groundingChunks: 42 } }] })
+	}));
 	const provider = configuredProvider(transport);
 	await expectWebError(provider.search({ query: "deepseek harness" }), "MALFORMED_RESPONSE");
 });
@@ -432,20 +441,20 @@ test("search() maps a 2xx body with a present non-array items field to MALFORMED
 // Transport-level failures: timeout / cancel / provider error (acceptance 4)
 // ---------------------------------------------------------------------------
 
-test("classifyGoogleFetchError: aborted signal wins; otherwise the thrown error decides", () => {
+test("classifyGeminiFetchError: aborted signal wins; otherwise the thrown error decides", () => {
 	const aborted = new AbortController();
 	aborted.abort();
 	const timedOut = new AbortController();
 	timedOut.abort(new DOMException("The operation was aborted due to a timeout", "TimeoutError"));
 
-	assert.equal(classifyGoogleFetchError(new Error("fetch failed"), aborted.signal), "aborted");
-	assert.equal(classifyGoogleFetchError(new Error("fetch failed"), timedOut.signal), "timeout");
-	assert.equal(classifyGoogleFetchError(new DOMException("The operation was aborted", "AbortError"), undefined), "aborted");
+	assert.equal(classifyGeminiFetchError(new Error("fetch failed"), aborted.signal), "aborted");
+	assert.equal(classifyGeminiFetchError(new Error("fetch failed"), timedOut.signal), "timeout");
+	assert.equal(classifyGeminiFetchError(new DOMException("The operation was aborted", "AbortError"), undefined), "aborted");
 	assert.equal(
-		classifyGoogleFetchError(Object.assign(new Error("timeout"), { name: "TimeoutError" }), undefined),
+		classifyGeminiFetchError(Object.assign(new Error("timeout"), { name: "TimeoutError" }), undefined),
 		"timeout"
 	);
-	assert.equal(classifyGoogleFetchError(new Error("fetch failed"), undefined), "provider_failure");
+	assert.equal(classifyGeminiFetchError(new Error("fetch failed"), undefined), "provider_failure");
 });
 
 test("search() maps a transport throw to a structured WebError with a credential-safe cause", async () => {
@@ -458,24 +467,24 @@ test("search() maps a transport throw to a structured WebError with a credential
 	const err = await expectWebError(provider.search({ query: "deepseek harness" }), "PROVIDER_FAILURE");
 	const cause = (err as Error).cause;
 	assert.ok(cause instanceof Error, "a cause is chained (for diagnosis)");
-	assert.notEqual(cause, boom, "the raw transport error is NOT chained — it may embed the request URL");
+	assert.notEqual(cause, boom, "the raw transport error is NOT chained — it may embed request details");
 	assert.equal(cause.message, "fetch failed", "the safe parts of the failure survive");
 	assert.equal(cause.name, "Error");
 });
 
 test("sanitizeTransportCause: a URL-embedding transport error is redacted in the cause", () => {
-	// A production transport (or a proxy) may embed the full request URL —
-	// credential included — in its error text. The chained cause must not
-	// carry it.
+	// A production transport (or a proxy) may embed the full request URL in
+	// its error text. The chained cause must not carry it. (Defense in depth:
+	// the adapter's own requests carry the credential in a header, but a
+	// proxy's error text is outside the adapter's control.)
 	const raw = new TypeError(
-		`fetch failed: GET https://customsearch.googleapis.com/customsearch/v1?key=${FAKE_API_KEY}&cx=${FAKE_CX}&q=deepseek`
+		`fetch failed: POST ${GEMINI_SEARCH_ENDPOINT_BASE}/${GEMINI_SEARCH_DEFAULT_MODEL}:generateContent?key=${FAKE_API_KEY} failed`
 	);
 	raw.name = "TypeError";
 
 	const cause = sanitizeTransportCause(raw);
 	assert.equal(cause.name, "TypeError");
 	assert.ok(!cause.message.includes(FAKE_API_KEY), "the credential must not survive into the cause");
-	assert.ok(!cause.message.includes(FAKE_CX), "the cx value must not survive into the cause");
 	assert.match(cause.message, /fetch failed/, "the non-credential part of the message survives");
 	assert.match(cause.message, /\[url redacted\]/, "the URL is replaced by a redaction marker");
 });
@@ -490,16 +499,16 @@ test("sanitizeTransportCause: preserves name and code of the underlying failure"
 test("scrubUrlTokens: redacts URL tokens and key=/cx= query fragments", () => {
 	assert.equal(scrubUrlTokens("ok"), "ok");
 	assert.equal(
-		scrubUrlTokens(`GET https://customsearch.googleapis.com/customsearch/v1?key=${FAKE_API_KEY}&cx=${FAKE_CX} failed`),
-		"GET [url redacted] failed"
+		scrubUrlTokens(`POST ${GEMINI_SEARCH_ENDPOINT_BASE}/x:generateContent?key=${FAKE_API_KEY} failed`),
+		"POST [url redacted] failed"
 	);
-	assert.equal(scrubUrlTokens(`retry key=${FAKE_API_KEY} then cx=${FAKE_CX}`), "retry key=[redacted] then cx=[redacted]");
+	assert.equal(scrubUrlTokens(`retry key=${FAKE_API_KEY} then cx=some-engine`), "retry key=[redacted] then cx=[redacted]");
 });
 
 test("search() honors an already-aborted signal (ABORTED) without any network work", async () => {
 	const controller = new AbortController();
 	controller.abort();
-	const { transport, calls } = makeTransport((_url, signal) => {
+	const { transport, calls } = makeTransport((_request, signal) => {
 		if (signal?.aborted) {
 			throw new DOMException("The operation was aborted", "AbortError");
 		}
@@ -508,7 +517,7 @@ test("search() honors an already-aborted signal (ABORTED) without any network wo
 	const provider = configuredProvider(transport);
 
 	const err = await expectWebError(provider.search({ query: "deepseek harness" }, controller.signal), "ABORTED");
-	// Issue #6: the transport receives a signal FUSED with the provider's
+	// The transport receives a signal FUSED with the provider's
 	// requestTimeoutMs deadline (AbortSignal.any), so it is not the caller's
 	// signal object itself — but the caller's abort must propagate to it.
 	assert.equal(calls[0]?.signal?.aborted, true, "the caller's abort propagates to the transport signal");
@@ -519,7 +528,7 @@ test("search() honors an already-aborted signal (ABORTED) without any network wo
 test("search() maps a timeout abort (TimeoutError reason) to TIMEOUT", async () => {
 	const controller = new AbortController();
 	controller.abort(new DOMException("The operation was aborted due to a timeout", "TimeoutError"));
-	const { transport } = makeTransport((_url, signal) => {
+	const { transport } = makeTransport((_request, signal) => {
 		if (signal?.aborted) {
 			throw new DOMException("The operation was aborted due to a timeout", "TimeoutError");
 		}
@@ -533,8 +542,8 @@ test("search() maps a timeout abort (TimeoutError reason) to TIMEOUT", async () 
 
 test("search() forwards the signal: an in-flight request aborts with ABORTED", async () => {
 	const controller = new AbortController();
-	const { transport, calls } = makeTransport((_url, signal) => {
-		return new Promise<GoogleHttpResponse>((resolve, reject) => {
+	const { transport, calls } = makeTransport((_request, signal) => {
+		return new Promise<GeminiHttpResponse>((resolve, reject) => {
 			const timer = setTimeout(() => resolve({ status: 200, body: SUCCESS_BODY }), 500);
 			signal?.addEventListener("abort", () => {
 				clearTimeout(timer);
@@ -580,7 +589,7 @@ test("no Google credential in tracked files except fake fixture values inside te
 		} catch {
 			continue;
 		}
-		if (text.includes(FAKE_API_KEY) || text.includes(FAKE_CX)) {
+		if (text.includes(FAKE_API_KEY)) {
 			assert.ok(
 				file.startsWith("test/"),
 				`credential-shaped fixture values must stay inside test/ fixtures, found in ${file}`

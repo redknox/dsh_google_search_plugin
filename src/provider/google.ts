@@ -1,17 +1,25 @@
 /**
- * The Google search provider for the `ctx.web` seam (Issues #2, #4, #6).
+ * The Google search provider for the `ctx.web` seam (Issues #2, #4, #6, #7).
  *
  * This plugin is **provider-only** (ARCHITECTURE.md): it registers a
  * `WebSearchProvider` on `ctx.web` (`@deepseek-ai/dsh-web`). The model-facing
  * `web_search` tool — its schema, rendering, and prompt guidance — is owned by
  * `@deepseek-ai/dsh-tool-web`; this plugin does not reimplement or shadow it.
  *
- * `search()` translates the seam's `WebSearchRequest` into a Google Custom
- * Search JSON API call (the provider edge, `./transport.ts`), normalizes the
- * response onto the seam's `WebSearchResult` (`./normalize.ts`), and maps
- * every failure path onto a structured `WebError` (`./errors.ts`). Google's
- * wire format stays inside this adapter layer and never leaks into the seam
- * (ENGINEERING.md §1).
+ * `search()` translates the seam's `WebSearchRequest` into a Gemini API
+ * `google_search` grounding call (the provider edge, `./transport.ts`),
+ * normalizes the response onto the seam's `WebSearchResult`
+ * (`./normalize.ts`), and maps every failure path onto a structured
+ * `WebError` (`./errors.ts`). Google's wire format stays inside this adapter
+ * layer and never leaks into the seam (ENGINEERING.md §1).
+ *
+ * **Issue #7 migration.** The backend is the Gemini API `google_search`
+ * grounding tool, not the Custom Search JSON API (retired by Google, closed
+ * to new customers — see the transport module doc). The grounding API needs
+ * only an API key: there is no engine id and no per-request result-count,
+ * language, region, or SafeSearch control. The seam still enforces
+ * `maxResults` on the way back; the result count is whatever the grounding
+ * response returns.
  *
  * Configuration (Issue #6): the provider is built from the plugin's persisted
  * settings section (the {@link Settings} schema, see `./config.ts`) plus the
@@ -20,26 +28,26 @@
  * value that is never persisted), then the Harness credential facilities,
  * then the launching environment, then the process environment — and are
  * never cached on the provider or stored in ordinary settings
- * (ENGINEERING.md §4). Behavior settings (result limit, language, region,
- * SafeSearch, request timeout) come from the settings section and may be
- * changed at runtime through the `google-search` settings section without
- * editing source. The settings section has no `apiKey` field, so the
- * credential can never be persisted through it.
+ * (ENGINEERING.md §4). Behavior settings (grounding model, request timeout)
+ * come from the settings section and may be changed at runtime through the
+ * `google-search` settings section without editing source. The settings
+ * section has no `apiKey` field, so the credential can never be persisted
+ * through it.
  *
  * `available()` is the cheap, **synchronous** check the seam contract
- * requires: it reports whether a *resolution path* exists for every required
- * value (a path, not a value) and makes **no network calls** and no
- * asynchronous resolution. When no path yields a value, `search()` fails
- * with a structured, actionable `MISSING_CREDENTIAL` error naming the
- * missing setting/environment variable (never its value) — the canonical DSH
- * credential pattern (cf. `@deepseek-ai/dsh-web-search-deepseek`).
+ * requires: it reports whether a *resolution path* exists for the credential
+ * (a path, not a value) and makes **no network calls** and no asynchronous
+ * resolution. When no path yields a value, `search()` fails with a
+ * structured, actionable `MISSING_CREDENTIAL` error naming the missing
+ * setting/environment variable (never its value) — the canonical DSH
+ * credential pattern.
  *
  * Cancellation: the seam's `signal` is forwarded to the transport; an aborted
  * caller produces a structured `ABORTED` (or `TIMEOUT` when the abort reason
  * is a `TimeoutError`/`TimeoutReason`), never a hang and never a
  * success-shaped result. The `requestTimeoutMs` setting adds a provider-level
  * deadline (via `@deepseek-ai/dsh-timeout`'s `deadline()`) on top of the
- * caller's signal, so a hung Google request degrades to a stable `TIMEOUT`.
+ * caller's signal, so a hung Gemini request degrades to a stable `TIMEOUT`.
  */
 
 import type { WebSearchProvider, WebSearchRequest, WebSearchResult } from "@deepseek-ai/dsh-web";
@@ -47,20 +55,17 @@ import { deadline } from "@deepseek-ai/dsh-timeout";
 import type { Context } from "@deepseek-ai/cordis";
 
 import {
-	GOOGLE_SEARCH_API_KEY_ENV,
-	GOOGLE_SEARCH_ENGINE_ID_ENV,
+	GEMINI_API_KEY_ENV,
 	Settings,
 	googleSearchConfigPathExists,
 	resolveGoogleSearchCredential,
-	resolveGoogleSearchEngineId,
 	type GoogleSearchSettings
 } from "./config.js";
 import { mapGoogleSearchFailure } from "./errors.js";
 import {
-	defaultGoogleHttpTransport,
-	googleNumForMaxResults,
-	performGoogleSearch,
-	type GoogleHttpTransport
+	defaultGeminiHttpTransport,
+	performGeminiSearch,
+	type GeminiHttpTransport
 } from "./transport.js";
 
 /** Stable provider id, unique within the search capability kind. */
@@ -72,11 +77,11 @@ export const GOOGLE_SEARCH_PROVIDER_ID = "google";
  * All fields are injectable for tests: `settings` is the persisted settings
  * section (defaults to the schema's defaults), `apiKey` is the literal
  * credential from the plugin composition input (a `role("secret")` value that
- * is never persisted), `env` is the env source the credential/engine-id
- * fallbacks are resolved from (defaults to `process.env`), `ctx` is the plugin
- * context supplying the credential and environment planes (defaults to
- * `undefined` — the bare provider path), and `transport` is the HTTP transport
- * used for search calls (defaults to the runtime's global `fetch`).
+ * is never persisted), `env` is the env source the credential fallback is
+ * resolved from (defaults to `process.env`), `ctx` is the plugin context
+ * supplying the credential and environment planes (defaults to `undefined`
+ * — the bare provider path), and `transport` is the HTTP transport used for
+ * search calls (defaults to the runtime's global `fetch`).
  * Production code builds the provider from the plugin's settings section plus
  * the literal composition key.
  */
@@ -98,12 +103,12 @@ export interface GoogleSearchProviderOptions {
 	 * `apiKeyEnv` reference through the credential/environment planes.
 	 */
 	readonly apiKey?: string;
-	/** Env source for the credential/engine-id fallbacks (defaults to `process.env`). */
+	/** Env source for the credential fallback (defaults to `process.env`). */
 	readonly env?: Record<string, string | undefined>;
 	/** Plugin context supplying the credentials/launching-environment planes. */
 	readonly ctx?: Context;
 	/** HTTP transport for search calls (defaults to the global `fetch`). */
-	readonly transport?: GoogleHttpTransport;
+	readonly transport?: GeminiHttpTransport;
 }
 
 /**
@@ -111,12 +116,12 @@ export interface GoogleSearchProviderOptions {
  *
  * Configuration is resolved **per operation** (not eagerly at construction):
  * `available()` reports that a resolution path exists, and each `search()`
- * resolves the credential and engine id fresh, so a credential stored in the
- * Harness facilities or a settings change takes effect without rebuilding
- * the provider. When no path yields a value, `search()` fails with a
- * structured, actionable `MISSING_CREDENTIAL` error naming the missing
- * setting/environment variables (never their values). No secret is ever
- * cached, persisted, or included in an error message.
+ * resolves the credential fresh, so a credential stored in the Harness
+ * facilities or a settings change takes effect without rebuilding the
+ * provider. When no path yields a value, `search()` fails with a structured,
+ * actionable `MISSING_CREDENTIAL` error naming the missing setting/environment
+ * variable (never its value). No secret is ever cached, persisted, or
+ * included in an error message.
  */
 export function buildGoogleSearchProvider(options: GoogleSearchProviderOptions = {}): WebSearchProvider {
 	// The active configuration source: the resolved settings scope while one
@@ -132,14 +137,13 @@ export function buildGoogleSearchProvider(options: GoogleSearchProviderOptions =
 	const literalApiKey = options.apiKey;
 	const env = options.env ?? process.env;
 	const ctx = options.ctx;
-	const transport = options.transport ?? defaultGoogleHttpTransport;
+	const transport = options.transport ?? defaultGeminiHttpTransport;
 
 	const missingMessage = (missing: readonly string[]): string =>
 		`google search provider is not configured: missing ${missing
-			.map((name) =>
-				name === GOOGLE_SEARCH_ENGINE_ID_ENV
-					? `the engine id (setting "engineId" or environment variable ${name})`
-					: `the API credential (set the ${name} environment variable, or store the credential under the "apiKeyEnv" name in the Harness credential facilities)`
+			.map(
+				(name) =>
+					`the API credential (set the ${name} environment variable, or store the credential under the "apiKeyEnv" name in the Harness credential facilities)`
 			)
 			.join(" and ")} (set them at runtime; never commit the credential)`;
 
@@ -154,23 +158,10 @@ export function buildGoogleSearchProvider(options: GoogleSearchProviderOptions =
 			// between searches).
 			const settings = settingsSource();
 			const apiKey = await resolveGoogleSearchCredential(ctx, settings, literalApiKey, env);
-			const cx = resolveGoogleSearchEngineId(settings, env);
 
-			if (apiKey === undefined || cx === undefined) {
-				const missing: string[] = [];
-				if (apiKey === undefined) {
-					missing.push(GOOGLE_SEARCH_API_KEY_ENV);
-				}
-				if (cx === undefined) {
-					missing.push(GOOGLE_SEARCH_ENGINE_ID_ENV);
-				}
-				throw mapGoogleSearchFailure("missing_credential", missingMessage(missing));
+			if (apiKey === undefined) {
+				throw mapGoogleSearchFailure("missing_credential", missingMessage([GEMINI_API_KEY_ENV]));
 			}
-
-			// The caller's bound wins when given; otherwise the configured
-			// default applies. Both are clamped to the API's 1..10 range.
-			const maxResults = request.maxResults ?? settings.maxResults;
-			const num = googleNumForMaxResults(maxResults);
 
 			// Provider-level deadline (requestTimeoutMs) fused with the
 			// caller's signal: the timeout aborts with a TimeoutReason, which
@@ -178,21 +169,11 @@ export function buildGoogleSearchProvider(options: GoogleSearchProviderOptions =
 			const requestTimeoutMs = settings.requestTimeoutMs ?? 30_000;
 			const d = deadline(signal, requestTimeoutMs, "GOOGLE_SEARCH_TIMEOUT");
 			try {
-				return await performGoogleSearch(
+				return await performGeminiSearch(
 					{
 						apiKey,
-						cx,
-						query: request.query,
-						...(num !== undefined ? { num } : {}),
-						...(settings.language !== undefined && settings.language.trim().length > 0
-							? { language: settings.language }
-							: {}),
-						...(settings.region !== undefined && settings.region.trim().length > 0
-							? { region: settings.region }
-							: {}),
-						// Google's default is "off"; sending it explicitly is
-						// noise, so only the non-default "active" is sent.
-						...(settings.safeSearch === "active" ? { safe: "active" as const } : {})
+						model: settings.model,
+						query: request.query
 					},
 					transport,
 					d.signal

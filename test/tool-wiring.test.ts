@@ -1,14 +1,14 @@
 /**
- * Issue #5 acceptance tests — the Google backend wired into the Harness tool
- * contract, end to end.
+ * Issue #5 acceptance tests (Issue #7 migration) — the Google backend wired
+ * into the Harness tool contract, end to end.
  *
  * This is the **integration** half of the plugin's story. `google.test.ts`
- * and `normalize.test.ts` prove the *adapter* (Google wire → seam types) and
- * `registration.test.ts` proves the *provider registration* on the seam. This
- * file composes the **real** model-facing tool stack on top of the real seam
- * and the real Google provider, and drives the tool through the registry's
- * public `ctx.tools.execute(...)` entry point — exactly the path the Harness
- * agent loop takes:
+ * and `normalize.test.ts` prove the *adapter* (Gemini grounding wire → seam
+ * types) and `registration.test.ts` proves the *provider registration* on
+ * the seam. This file composes the **real** model-facing tool stack on top
+ * of the real seam and the real Google provider, and drives the tool through
+ * the registry's public `ctx.tools.execute(...)` entry point — exactly the
+ * path the Harness agent loop takes:
  *
  *   model args → `web_search` tool (dsh-tool-web) → `ctx.web.search()` (dsh-web
  *   seam) → Google `WebSearchProvider` (this plugin) → mock transport
@@ -16,7 +16,7 @@
  * The tool, the registry, the seam, and the timeout policy are the **real
  * published DSH packages** (`@deepseek-ai/dsh-tool-web`, `@deepseek-ai/dsh-tools`,
  * `@deepseek-ai/dsh-web`, `@deepseek-ai/dsh-tool-call-timeout-policy`). The only
- * thing mocked is the HTTP transport (an injected `GoogleHttpTransport`), so the
+ * thing mocked is the HTTP transport (an injected `GeminiHttpTransport`), so the
  * suite is fully offline and needs no live credential (ENGINEERING.md §8).
  *
  * The plugin stays **provider-only** (ARCHITECTURE.md): it supplies the search
@@ -51,69 +51,93 @@ import * as timeoutPolicy from "@deepseek-ai/dsh-tool-call-timeout-policy";
 import { CallId } from "@deepseek-ai/dsh-llm";
 
 import { buildGoogleSearchProvider } from "../src/index.js";
+import { GEMINI_API_KEY_ENV } from "../src/provider/config.js";
 import {
-	GOOGLE_SEARCH_API_KEY_ENV,
-	GOOGLE_SEARCH_ENGINE_ID_ENV
-} from "../src/provider/config.js";
-import type { GoogleHttpTransport, GoogleHttpResponse } from "../src/provider/transport.js";
+	GEMINI_API_KEY_HEADER,
+	GEMINI_SEARCH_DEFAULT_MODEL,
+	GEMINI_SEARCH_ENDPOINT_BASE,
+	GEMINI_SEARCH_PROMPT_TEMPLATE,
+	type GeminiHttpTransport,
+	type GeminiHttpResponse,
+	type GeminiSearchHttpRequest
+} from "../src/provider/transport.js";
 
 // ---------------------------------------------------------------------------
 // Fixtures — fake values only; never a real credential (acceptance 6).
 // ---------------------------------------------------------------------------
 
 const FAKE_API_KEY = "fake-api-key-000";
-const FAKE_CX = "fake-cx-000";
 
 const CONFIG_ENV: Record<string, string | undefined> = {
-	[GOOGLE_SEARCH_API_KEY_ENV]: FAKE_API_KEY,
-	[GOOGLE_SEARCH_ENGINE_ID_ENV]: FAKE_CX
+	[GEMINI_API_KEY_ENV]: FAKE_API_KEY
 };
 
-/** One recorded transport call: the serialized URL and the forwarded signal. */
+/** One recorded transport call: the serialized request and the forwarded signal. */
 interface RecordedCall {
-	url: string;
+	request: GeminiSearchHttpRequest;
 	signal?: AbortSignal | undefined;
 }
 
 /**
- * Build a mock `GoogleHttpTransport` that records every call (URL + the
+ * Build a mock `GeminiHttpTransport` that records every call (request + the
  * forwarded `AbortSignal`) and delegates to a handler. This is the single
  * injected seam that keeps the suite offline.
  */
-function makeTransport(handler: (url: string, signal?: AbortSignal) => Promise<GoogleHttpResponse>) {
+function makeTransport(
+	handler: (request: GeminiSearchHttpRequest, signal?: AbortSignal) => Promise<GeminiHttpResponse> | GeminiHttpResponse
+) {
 	const calls: RecordedCall[] = [];
-	const transport: GoogleHttpTransport = async (url, signal) => {
-		calls.push({ url, signal });
-		return handler(url, signal);
+	const transport: GeminiHttpTransport = async (request, signal) => {
+		calls.push({ request, signal });
+		return handler(request, signal);
 	};
 	return { transport, calls };
 }
 
-/** A realistic Google Custom Search success body with `n` result items. */
-function googleSuccessBody(n: number): string {
-	const items = Array.from({ length: n }, (_, i) => ({
-		title: `Result ${i + 1}`,
-		link: `https://example.com/${i + 1}`,
-		snippet: `Snippet text for result ${i + 1}.`
-	}));
-	return JSON.stringify({ kind: "customsearch#search", items });
+/** Extract the caller's query from a serialized grounding request body. */
+function queryOf(request: GeminiSearchHttpRequest): string {
+	const body = JSON.parse(request.body) as {
+		contents: { parts: { text: string }[] }[];
+	};
+	const text = body.contents[0]?.parts?.[0]?.text ?? "";
+	assert.ok(text.startsWith(GEMINI_SEARCH_PROMPT_TEMPLATE), "the body carries the fixed prompt template");
+	return text.slice(GEMINI_SEARCH_PROMPT_TEMPLATE.length);
 }
 
-/** A realistic Google zero-result body: `items` is ABSENT (not malformed). */
-const GOOGLE_EMPTY_BODY = JSON.stringify({
-	kind: "customsearch#search",
-	queries: { request: [{ q: "zzz", totalResults: "0" }] },
-	searchInformation: { totalResults: "0" }
+/** A realistic Gemini grounding success body with `n` grounding chunks. */
+function geminiSuccessBody(n: number, answer = "The synthesized answer."): string {
+	const chunks = Array.from({ length: n }, (_, i) => ({
+		web: { uri: `https://example.com/${i + 1}`, title: `example.com/page-${i + 1}` }
+	}));
+	return JSON.stringify({
+		candidates: [
+			{
+				content: { parts: [{ text: answer }] },
+				finishReason: "STOP",
+				groundingMetadata: { groundingChunks: chunks, webSearchQueries: ["deepseek harness"] }
+			}
+		]
+	});
+}
+
+/** A realistic Gemini zero-result body: `groundingMetadata` is ABSENT. */
+const GEMINI_EMPTY_BODY = JSON.stringify({
+	candidates: [
+		{
+			content: { parts: [{ text: "A web search yielded no results." }] },
+			finishReason: "STOP"
+		}
+	]
 });
 
-/** A Google non-2xx error body with a documented `reason`. */
-function googleErrorBody(status: number, reason: string, message: string): string {
+/** A Gemini non-2xx error body in the documented shape. */
+function geminiErrorBody(status: number, reason: string, message: string): string {
 	return JSON.stringify({
 		error: {
 			code: status,
 			message,
-			status: String(status),
-			errors: [{ reason, message }]
+			status: String(status).toUpperCase(),
+			details: [{ "@type": "type.googleapis.com/google.rpc.ErrorInfo", reason, domain: "googleapis.com" }]
 		}
 	});
 }
@@ -144,12 +168,9 @@ interface ToolWebConfig {
  * **real** Google provider (with the injected mock transport) on the seam.
  *
  * `searchMaxResults` is set to 5 so the seam's `maxResults` enforcement is
- * observable (the API would otherwise return up to 10).
+ * observable (the grounding response may return more chunks than that).
  */
-async function buildHarness(
-	transport: GoogleHttpTransport,
-	toolConfig: ToolWebConfig
-): Promise<Context> {
+async function buildHarness(transport: GeminiHttpTransport, toolConfig: ToolWebConfig): Promise<Context> {
 	const ctx = new Context();
 	new SystemPrompt(ctx, {});
 	new ToolRuntime(ctx, {});
@@ -175,9 +196,7 @@ async function buildHarness(
 	await ctx.plugin(toolWebPlugin, toolConfig);
 
 	// The plugin under test supplies the backend; the tool above consumes it.
-	ctx.web.registerSearchProvider(
-		buildGoogleSearchProvider({ env: CONFIG_ENV, transport })
-	);
+	ctx.web.registerSearchProvider(buildGoogleSearchProvider({ env: CONFIG_ENV, transport }));
 	return ctx;
 }
 
@@ -210,7 +229,7 @@ const DEFAULT_TOOL_CONFIG: ToolWebConfig = {
 test("single query success: the tool returns normalized ranked sources", async () => {
 	const { transport, calls } = makeTransport(async () => ({
 		status: 200,
-		body: googleSuccessBody(3)
+		body: geminiSuccessBody(3)
 	}));
 	const ctx = await buildHarness(transport, DEFAULT_TOOL_CONFIG);
 
@@ -220,26 +239,32 @@ test("single query success: the tool returns normalized ranked sources", async (
 	const value = result.value as unknown as WebSearchToolValue;
 	assert.equal(value.truncated, false);
 	assert.equal(value.sources.length, 3);
-	// Ranked order is preserved from the provider (Google returns ranked items).
+	// Ranked order is preserved from the provider (grounding order).
 	assert.deepEqual(
 		value.sources.map((s) => s.url),
 		["https://example.com/1", "https://example.com/2", "https://example.com/3"]
 	);
-	// The normalized source carries only the seam's fields, mapped from Google.
+	// The normalized source carries only the seam's fields, mapped from Gemini.
 	assert.deepEqual(value.sources[0], {
 		url: "https://example.com/1",
-		title: "Result 1",
-		snippet: "Snippet text for result 1."
+		title: "example.com/page-1"
 	});
+	// The provider's synthesized answer crosses the seam as `content`.
+	assert.equal(value.content, "The synthesized answer.");
 
-	// The request went through the seam to exactly one Google call, with the
-	// tool's `searchMaxResults` bound applied at the request layer as `num`.
+	// The request went through the seam to exactly one Gemini call, with the
+	// documented grounding request shape.
 	assert.equal(calls.length, 1);
-	const params = new URL(calls[0]!.url).searchParams;
-	assert.equal(params.get("q"), "deepseek harness");
-	assert.equal(params.get("num"), "5", "the tool's maxResults bound is sent as num");
-	assert.equal(params.get("key"), FAKE_API_KEY);
-	assert.equal(params.get("cx"), FAKE_CX);
+	const call = calls[0]!;
+	assert.equal(call.request.url, `${GEMINI_SEARCH_ENDPOINT_BASE}/${GEMINI_SEARCH_DEFAULT_MODEL}:generateContent`);
+	assert.equal(call.request.headers[GEMINI_API_KEY_HEADER], FAKE_API_KEY, "the credential travels in the header");
+	assert.ok(!call.request.url.includes(FAKE_API_KEY), "the URL never carries the credential");
+	assert.equal(queryOf(call.request), "deepseek harness");
+	const body = JSON.parse(call.request.body) as Record<string, unknown>;
+	assert.deepEqual(body["tools"], [{ google_search: {} }]);
+	// The grounding API has no per-request result-count control: the tool's
+	// `searchMaxResults` bound is enforced by the seam on the way back.
+	assert.equal(body["num"], undefined, "no result-count parameter exists in the grounding API");
 });
 
 test("maxResults bound: the seam truncates an over-returning provider and flags it", async () => {
@@ -247,7 +272,7 @@ test("maxResults bound: the seam truncates an over-returning provider and flags 
 	// the bound and sets truncated (the adapter itself always reports false).
 	const { transport } = makeTransport(async () => ({
 		status: 200,
-		body: googleSuccessBody(8)
+		body: geminiSuccessBody(8)
 	}));
 	const ctx = await buildHarness(transport, DEFAULT_TOOL_CONFIG);
 
@@ -262,21 +287,35 @@ test("multi-query merge: concurrent queries are deduped, ranked round-robin, and
 	// Two queries; the second returns a source the first also returned (same
 	// url) to exercise dedup, plus a fresh one.
 	let queryIndex = 0;
-	const { transport } = makeTransport(async (url) => {
+	const { transport } = makeTransport(async (request) => {
 		queryIndex += 1;
-		const q = new URL(url).searchParams.get("q");
+		const q = queryOf(request);
 		const body =
 			q === "alpha"
 				? JSON.stringify({
-						items: [
-							{ title: "A1", link: "https://example.com/a1" },
-							{ title: "Shared", link: "https://example.com/shared" }
+						candidates: [
+							{
+								content: { parts: [{ text: "A." }] },
+								groundingMetadata: {
+									groundingChunks: [
+										{ web: { uri: "https://example.com/a1", title: "a1.example" } },
+										{ web: { uri: "https://example.com/shared", title: "shared.example" } }
+									]
+								}
+							}
 						]
 					})
 				: JSON.stringify({
-						items: [
-							{ title: "Shared", link: "https://example.com/shared" },
-							{ title: "B1", link: "https://example.com/b1" }
+						candidates: [
+							{
+								content: { parts: [{ text: "B." }] },
+								groundingMetadata: {
+									groundingChunks: [
+										{ web: { uri: "https://example.com/shared", title: "shared.example" } },
+										{ web: { uri: "https://example.com/b1", title: "b1.example" } }
+									]
+								}
+							}
 						]
 					});
 		return { status: 200, body };
@@ -286,14 +325,14 @@ test("multi-query merge: concurrent queries are deduped, ranked round-robin, and
 	const result = await runWebSearch(ctx, ["alpha", "beta"], new AbortController().signal);
 	assert.equal(result.isError, false, `expected success, got: ${JSON.stringify(result.error)}`);
 	const value = result.value as unknown as WebSearchToolValue;
-	// Round-robin by rank: A1, Shared, B1 (the duplicate Shared is dropped).
+	// Round-robin by rank: a1, shared, b1 (the duplicate shared is dropped).
 	assert.deepEqual(
 		value.sources.map((s) => s.url),
 		["https://example.com/a1", "https://example.com/shared", "https://example.com/b1"]
 	);
 	assert.equal(value.sources.length, 3);
 	assert.equal(value.truncated, false);
-	assert.equal(queryIndex, 2, "each query issued its own Google call");
+	assert.equal(queryIndex, 2, "each query issued its own Gemini call");
 });
 
 // ---------------------------------------------------------------------------
@@ -303,7 +342,7 @@ test("multi-query merge: concurrent queries are deduped, ranked round-robin, and
 test("the web_search tool contract is Google-neutral", async () => {
 	const { transport } = makeTransport(async () => ({
 		status: 200,
-		body: googleSuccessBody(1)
+		body: geminiSuccessBody(1)
 	}));
 	const ctx = await buildHarness(transport, DEFAULT_TOOL_CONFIG);
 
@@ -311,27 +350,21 @@ test("the web_search tool contract is Google-neutral", async () => {
 	assert.ok(definition, "the web_search tool is registered by dsh-tool-web");
 
 	// The model-facing schema is the tool's own: a `queries` array. No Google
-	// parameter (`key`, `cx`, `q`, `num`), endpoint, or wire field name appears
-	// in the tool's name, description, or parameter schema.
+	// endpoint, credential, or wire field name appears in the tool's name,
+	// description, or parameter schema.
 	const schemaText = JSON.stringify({
 		name: definition.name,
 		description: definition.description,
 		parameters: definition.parameters
 	});
-	for (const googleToken of [
-		"customsearch",
-		"googleapis",
-		"GOOGLE_SEARCH",
-		FAKE_CX,
-		FAKE_API_KEY
-	]) {
+	for (const googleToken of ["customsearch", "generativelanguage", "x-goog-api-key", "google_search", FAKE_API_KEY]) {
 		assert.ok(
 			!schemaText.includes(googleToken),
 			`the tool contract must not mention Google internals, but it contains: ${googleToken}`
 		);
 	}
-	// The tool asks for `queries` (its own vocabulary), not a Google query
-	// parameter (`q`): the parameter schema exposes exactly one property.
+	// The tool asks for `queries` (its own vocabulary), not a Google wire
+	// field: the parameter schema exposes exactly one property.
 	const parameters = definition.parameters as {
 		properties?: Record<string, unknown>;
 		required?: string[];
@@ -351,7 +384,7 @@ test("the web_search tool contract is Google-neutral", async () => {
 test("provider failure: a 5xx becomes a stable structured error, never the raw Google payload", async () => {
 	const { transport } = makeTransport(async () => ({
 		status: 503,
-		body: googleErrorBody(503, "backendError", "upstream down")
+		body: geminiErrorBody(503, "AVAILABLE", "upstream down")
 	}));
 	const ctx = await buildHarness(transport, DEFAULT_TOOL_CONFIG);
 
@@ -366,21 +399,21 @@ test("provider failure: a 5xx becomes a stable structured error, never the raw G
 	// status and reason, but never the raw Google body, the request URL, or
 	// the credential.
 	assert.match(error.message, /HTTP 503/);
-	assert.match(error.message, /backendError/);
+	assert.match(error.message, /AVAILABLE/);
 	assert.ok(
-		!error.message.includes(FAKE_API_KEY) && !error.message.includes(FAKE_CX),
+		!error.message.includes(FAKE_API_KEY),
 		`the credential must not leak into the tool-visible message: ${error.message}`
 	);
 	assert.ok(
-		!error.message.includes("customsearch.googleapis.com"),
-		"the request URL (which carries the credential) must not leak into the message"
+		!error.message.includes("generativelanguage.googleapis.com"),
+		"the request URL must not leak into the message"
 	);
 });
 
 test("provider failure: an invalid-credential 400 maps to the stable INVALID_CREDENTIAL code", async () => {
 	const { transport } = makeTransport(async () => ({
 		status: 400,
-		body: googleErrorBody(400, "badRequest", "API key not valid. Please pass a valid API key.")
+		body: geminiErrorBody(400, "INVALID_ARGUMENT", "API key not valid. Please pass a valid API key.")
 	}));
 	const ctx = await buildHarness(transport, DEFAULT_TOOL_CONFIG);
 
@@ -391,10 +424,10 @@ test("provider failure: an invalid-credential 400 maps to the stable INVALID_CRE
 });
 
 test("provider failure: quota and rate-limit map to their stable shared codes", async () => {
-	const quotaBody = googleErrorBody(403, "quotaExceeded", "Quota exceeded for quota metric 'Search'");
-	const rateBody = googleErrorBody(429, "rateLimitExceeded", "Rate limit exceeded");
+	const quotaBody = geminiErrorBody(429, "QUOTA_EXCEEDED", "Quota exceeded for quota metric 'GenerateContent'");
+	const rateBody = geminiErrorBody(429, "RESOURCE_EXHAUSTED", "Resource has been exhausted (e.g. check quota).");
 
-	const quota = await makeTransport(async () => ({ status: 403, body: quotaBody }));
+	const quota = await makeTransport(async () => ({ status: 429, body: quotaBody }));
 	const quotaCtx = await buildHarness(quota.transport, DEFAULT_TOOL_CONFIG);
 	const quotaResult = await runWebSearch(quotaCtx, ["q"], new AbortController().signal);
 	assert.equal(quotaResult.isError, true);
@@ -411,8 +444,8 @@ test("provider failure: quota and rate-limit map to their stable shared codes", 
 // 6 (success/empty paths): empty results are a success, not an error
 // ---------------------------------------------------------------------------
 
-test("empty results: a zero-result Google response is a successful empty result", async () => {
-	const { transport } = makeTransport(async () => ({ status: 200, body: GOOGLE_EMPTY_BODY }));
+test("empty results: a zero-result Gemini response is a successful empty result", async () => {
+	const { transport } = makeTransport(async () => ({ status: 200, body: GEMINI_EMPTY_BODY }));
 	const ctx = await buildHarness(transport, DEFAULT_TOOL_CONFIG);
 
 	const result = await runWebSearch(ctx, ["zzz"], new AbortController().signal);
@@ -426,23 +459,23 @@ test("empty results: a zero-result Google response is a successful empty result"
 // 6 (invalid input): the tool validates before any provider round-trip
 // ---------------------------------------------------------------------------
 
-test("invalid input: an empty queries array fails before any Google call", async () => {
+test("invalid input: an empty queries array fails before any Gemini call", async () => {
 	const { transport, calls } = makeTransport(async () => ({
 		status: 200,
-		body: googleSuccessBody(1)
+		body: geminiSuccessBody(1)
 	}));
 	const ctx = await buildHarness(transport, DEFAULT_TOOL_CONFIG);
 
 	const result = await runWebSearch(ctx, [], new AbortController().signal);
 	assert.equal(result.isError, true, "an empty queries array is an invalid tool call");
 	assert.match(result.error.message, /queries must contain at least one query/);
-	assert.equal(calls.length, 0, "no Google request is made for invalid input");
+	assert.equal(calls.length, 0, "no Gemini request is made for invalid input");
 });
 
-test("invalid input: more queries than the bound fail before any Google call", async () => {
+test("invalid input: more queries than the bound fail before any Gemini call", async () => {
 	const { transport, calls } = makeTransport(async () => ({
 		status: 200,
-		body: googleSuccessBody(1)
+		body: geminiSuccessBody(1)
 	}));
 	const ctx = await buildHarness(transport, DEFAULT_TOOL_CONFIG); // searchMaxQueries: 4
 
@@ -453,7 +486,7 @@ test("invalid input: more queries than the bound fail before any Google call", a
 	);
 	assert.equal(result.isError, true);
 	assert.match(result.error.message, /at most 4 queries/);
-	assert.equal(calls.length, 0, "no Google request is made for invalid input");
+	assert.equal(calls.length, 0, "no Gemini request is made for invalid input");
 });
 
 // ---------------------------------------------------------------------------
@@ -466,9 +499,11 @@ test("invalid input: more queries than the bound fail before any Google call", a
  * `AbortError` (the name `fetch` uses). This proves the signal is genuinely
  * forwarded from the tool, through the seam, to the provider transport.
  */
-function abortingTransport(handler?: (url: string, signal?: AbortSignal) => Promise<GoogleHttpResponse>) {
-	return makeTransport(async (url, signal) => {
-		if (handler) return handler(url, signal);
+function abortingTransport(
+	handler?: (request: GeminiSearchHttpRequest, signal?: AbortSignal) => Promise<GeminiHttpResponse>
+) {
+	return makeTransport(async (request, signal) => {
+		if (handler) return handler(request, signal);
 		await new Promise<void>((resolve, reject) => {
 			if (signal?.aborted) {
 				reject(Object.assign(new Error("The operation was aborted."), { name: "AbortError" }));
@@ -533,7 +568,7 @@ test("tool-call timeout: the cooperative budget aborts the provider transport", 
 test("repeated calls: the tool and provider stay consistent across many invocations", async () => {
 	const { transport, calls } = makeTransport(async () => ({
 		status: 200,
-		body: googleSuccessBody(2)
+		body: geminiSuccessBody(2)
 	}));
 	const ctx = await buildHarness(transport, DEFAULT_TOOL_CONFIG);
 
@@ -543,7 +578,7 @@ test("repeated calls: the tool and provider stay consistent across many invocati
 		const value = result.value as unknown as WebSearchToolValue;
 		assert.equal(value.sources.length, 2);
 	}
-	assert.equal(calls.length, 5, "each call issues exactly one Google request");
+	assert.equal(calls.length, 5, "each call issues exactly one Gemini request");
 	// The provider is still registered and available after the burst.
 	assert.equal(ctx.tools.get("web_search") !== undefined, true, "the tool is still registered");
 });
@@ -575,15 +610,13 @@ test("teardown: disposing the provider fiber leaves the tool registered but degr
 
 	const { transport } = makeTransport(async () => ({
 		status: 200,
-		body: googleSuccessBody(1)
+		body: geminiSuccessBody(1)
 	}));
 	const fiber = ctx.plugin({
 		name: "google-search-test",
 		inject: ["web"],
 		apply: (c: Context) => {
-			c.web.registerSearchProvider(
-				buildGoogleSearchProvider({ env: CONFIG_ENV, transport })
-			);
+			c.web.registerSearchProvider(buildGoogleSearchProvider({ env: CONFIG_ENV, transport }));
 		}
 	});
 	await fiber;
