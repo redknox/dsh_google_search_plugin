@@ -88,8 +88,34 @@ The Google backend target for the MVP is the **Gemini API
 [`google_search` grounding tool](https://ai.google.dev/gemini-api/docs/search-grounding)**:
 a `generateContent` call to a Gemini model with `tools: [{ google_search: {} }]`, which
 returns the model's synthesized answer plus `groundingMetadata` — the grounding chunks
-(`web.uri` + `web.title`) that map onto `WebSearchSource`, and the answer text that maps
-onto the seam's `content`.
+(`web.uri` + `web.title`), the citation relationship (`groundingSupports`), and the
+model's queries (`webSearchQueries`).
+
+**What the grounding API is — and is not.** Google documents the grounding tool as a
+*generated grounded response with associated Search Suggestions and citations*, not as a
+replacement SERP API. The grounding chunks are the **evidence** the model used for its
+generated answer: no Google contract establishes their order as a SERP ranking, and
+nothing in this plugin claims it (the source order is the response's chunk order).
+Consequently, a response without `groundingMetadata` carries **zero grounding sources** —
+it is not observable from the wire that a search executed and found zero results, and
+this repository's claims and evidence say so, and no more.
+
+**The Grounding contract (compliance mapping).** The DSH seam types
+(`WebSearchResult`/`WebSearchSource`) have no dedicated fields for the citation
+relationship or the Search Suggestions. Discarding them would leave the runtime without
+a compliant presentation path and would separate the answer from its citations, so the
+adapter preserves the grounded artifact **end to end through the fields the seam does
+have**: the answer with inline `[n]` citation markers (1-based into the `sources` array,
+which the DSH tool renders immediately after `content` as its "Sources:" list) plus a
+Search-suggestions section (one Google search link per `webSearchQueries` entry) cross
+the seam as `content`; the grounding chunks cross it as `sources`. Google's display
+terms for AI-generated grounded content require the associated Search Suggestions to be
+shown with the grounded results; this mapping satisfies that obligation at the
+tool-output boundary — every grounded result that reaches the model carries the
+suggestions inside `content`, so any presentation of the tool output keeps them attached
+to the answer. The `searchEntryPoint.renderedContent` HTML widget itself is not
+forwarded (a Google-branded UI artifact with no seam field); its required substance —
+the Search Suggestions — is preserved as plain markdown links.
 
 **Why not the Custom Search JSON API.** The original target, Google Programmable Search —
 [Custom Search JSON API](https://developers.google.com/custom-search/v1), is being retired
@@ -178,10 +204,12 @@ The first release (MVP) delivers exactly:
      settings (model, request timeout); the seam enforces the per-request
      `maxResults` bound on the way back (the grounding API has no per-request
      result-count control);
-   - maps the grounding response to `WebSearchSource[]` (`url`, `title?`) and the
-     synthesized answer to `content`, leaving absent fields `undefined` (the
-     grounding response carries no per-source snippet or date, so `snippet?` and
-     `publishedAt?` stay absent);
+   - maps the grounding response to `WebSearchSource[]` (`url`, `title?`) and
+     preserves the grounded artifact end to end through `content` (the answer
+     with inline citation markers plus the Search suggestions — see "Google
+     backend target (MVP)", The Grounding contract), leaving absent fields
+     `undefined` (the grounding response carries no per-source snippet or
+     date, so `snippet?` and `publishedAt?` stay absent);
    - `available()` returns a cheap synchronous check — whether a **resolution path**
      exists for every required value (a credential source) — without network
      access; the actual per-operation resolution happens in `search()`.

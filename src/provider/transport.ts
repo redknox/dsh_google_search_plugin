@@ -101,6 +101,13 @@ export interface GeminiSearchRequestOptions {
 	readonly model: string;
 	/** The search query (wrapped by the prompt template in the request body). */
 	readonly query: string;
+	/**
+	 * The seam's per-request result bound, when the request carries one.
+	 * Used **only** to clamp inline citation markers to the sources the seam
+	 * is guaranteed to keep — the grounding request itself carries no
+	 * result-count parameter, and the seam performs the truncation.
+	 */
+	readonly maxResults?: number;
 }
 
 /**
@@ -367,7 +374,8 @@ function isTimeoutName(name: string | undefined): boolean {
  * (The `MISSING_CREDENTIAL` path is owned by the provider, which resolves
  * configuration per operation before calling this.)
  *
- * @param options - credential + model + query (see above).
+ * @param options - credential + model + query (+ the seam's result bound,
+ *   see above).
  * @param transport - the HTTP transport (injectable for tests).
  * @param signal - the caller's cancellation signal, forwarded to the transport.
  */
@@ -408,8 +416,10 @@ export async function performGeminiSearch(
 		throw mapGoogleSearchFailure("malformed_response", "gemini search response is not valid JSON", err);
 	}
 	// Throws WebError(MALFORMED_RESPONSE) when the body cannot be mapped onto
-	// the seam shape (see normalize.ts for the rules).
-	return normalizeGeminiSearchResponse(parsed);
+	// the seam shape (see normalize.ts for the rules). `maxResults` clamps
+	// the inline citation markers to the sources the seam will keep; the
+	// seam itself performs the truncation.
+	return normalizeGeminiSearchResponse(parsed, options.maxResults);
 }
 
 /**

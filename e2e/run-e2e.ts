@@ -32,12 +32,18 @@
  * "unsupported by the backend" section (acceptance 5).
  *
  * Cases (issue #7 tasks):
- *   1. ordinary query          → normalized live results (acceptance 1)
- *   2. empty / no-result query → success with zero sources
- *   3. non-ASCII query         → query round-trips intact, normalized results
- *   4. result limit            → the seam caps the sources at maxResults
- *   5. invalid credential      → stable INVALID_CREDENTIAL, no value leaked
- *   6. cancellation            → forwarded signal aborts the real request
+ *   1. ordinary query              → normalized live results, with the
+ *      grounded artifact (answer + citations + Search suggestions) preserved
+ *      end to end (acceptance 1)
+ *   2. zero-grounding-sources query → success with zero sources (the wire
+ *      fact is "zero grounding sources", not "Google returned zero search
+ *      results")
+ *   3. non-ASCII query             → query round-trips intact, normalized
+ *      results
+ *   4. result limit                → the seam caps the sources at maxResults
+ *   5. invalid credential          → stable INVALID_CREDENTIAL, no value
+ *      leaked
+ *   6. cancellation                → forwarded signal aborts the real request
  *
  * Timeout: the provider-level `requestTimeoutMs` deadline is **not**
  * reproducible against the real (fast) API without a hanging endpoint, so it
@@ -309,6 +315,35 @@ function answerOf(result: ToolExecutionResult): string | undefined {
 	return typeof value?.content === "string" && value.content.length > 0 ? value.content : undefined;
 }
 
+/**
+ * Check the grounded artifact in a successful result: the `content` must
+ * carry the Search suggestions section (the compliance mapping of
+ * `webSearchQueries`), and — when the response carried grounding sources —
+ * inline citation markers `[n]` resolved against the sources list. Returns
+ * the evidence lines (or the failure reason).
+ */
+function groundedArtifactEvidence(result: ToolExecutionResult, sources: SourceShape[]): { ok: boolean; lines: string[] } {
+	const answer = answerOf(result);
+	const lines: string[] = [];
+	if (answer === undefined) {
+		return { ok: false, lines: ["no answer text in the result content"] };
+	}
+	const hasSuggestions = answer.includes("Search suggestions:");
+	const hasGoogleSuggestionLink = /Search suggestions:[\s\S]*https:\/\/www\.google\.com\/search\?q=/.test(answer);
+	lines.push(
+		`answer carries the Search suggestions section: ${hasSuggestions ? "yes" : "NO"} ` +
+			`(one Google search link per model query: ${hasGoogleSuggestionLink ? "yes" : "NO"})`
+	);
+	if (sources.length > 0) {
+		const markerCount = (answer.match(/\[\d+(?:, ?\d+)*\]/g) ?? []).length;
+		lines.push(
+			`inline citation markers in the answer: ${markerCount} ` +
+				`(1-based into the ${sources.length} source(s) the tool renders after the answer)`
+		);
+	}
+	return { ok: hasSuggestions && hasGoogleSuggestionLink, lines };
+}
+
 function errorText(result: ToolExecutionResult): string {
 	return result.isError ? `error ${result.error?.info?.code ?? "?"}: ${result.error?.message ?? ""}` : "no sources";
 }
@@ -322,22 +357,36 @@ async function runBehaviorCases(): Promise<void> {
 	// resolved per operation from the GEMINI_API_KEY environment variable.
 	const ctx = await buildHarness({});
 
-	// --- Case 1: ordinary query → normalized live results (acceptance 1) ---
+	// --- Case 1: ordinary query → normalized live results, grounded artifact
+	// preserved end to end (acceptance 1) ---
 	{
 		const result = await runWebSearch(ctx, ["deepseek harness"], new AbortController().signal);
 		const req = lastRequest();
 		const sources = sourcesOf(result);
 		const answer = answerOf(result);
-		if (isOk(result) && sources.length > 0 && req !== undefined) {
+		const artifact = groundedArtifactEvidence(result, sources);
+		if (isOk(result) && sources.length > 0 && req !== undefined && artifact.ok) {
 			record(
 				"ordinary query",
 				"pass",
-				`returned ${sources.length} normalized live source(s) and a synthesized answer`,
+				`returned ${sources.length} normalized live source(s) and a synthesized answer; the grounded artifact (answer + citations + Search suggestions) is preserved end to end`,
 				[
 					`request: POST ${req.url}`,
 					`headers: ${req.headerNames.join(", ")} (values redacted)`,
 					`body: prompt wrapping the query + tools=${JSON.stringify(req.tools)}`,
-					...(answer ? [`answer (first 200): ${answer.slice(0, 200).replace(/\n/g, " ")}`] : []),
+					...(answer ? [`answer (first 200): ${answer.slice(0, 200).replace(/\n/g, " ").trimEnd()}`] : []),
+					...artifact.lines,
+					...sourceLines(sources)
+				]
+			);
+		} else if (isOk(result) && sources.length > 0 && req !== undefined) {
+			record(
+				"ordinary query",
+				"fail",
+				`live results returned but the grounded artifact is incomplete: ${artifact.lines.join("; ")}`,
+				[
+					`request: POST ${req.url}`,
+					...(answer ? [`answer (first 200): ${answer.slice(0, 200).replace(/\n/g, " ").trimEnd()}`] : []),
 					...sourceLines(sources)
 				]
 			);
@@ -377,31 +426,31 @@ async function runBehaviorCases(): Promise<void> {
 		}
 	}
 
-	// --- Case 2: empty / no-result query (if reproducible) ---
+	// --- Case 2: zero-grounding-sources query (if reproducible) ---
 	{
 		const result = await runWebSearch(ctx, ["xkcdzyqwv98765 notarealquery"], new AbortController().signal);
 		const sources = sourcesOf(result);
 		const answer = answerOf(result);
 		if (isOk(result) && sources.length === 0) {
 			record(
-				"empty / no-result query",
+				"zero-grounding-sources query",
 				"pass",
-				"zero-result response (no groundingMetadata) is a successful empty result (not an error)",
+				"the response carried zero grounding sources (no groundingMetadata) and was a successful zero-source result (not an error); the wire does not say whether a search ran and found nothing",
 				[
 					`request: ${lastRequest()?.url ?? "(none)"}`,
-					...(answer ? [`answer (first 200): ${answer.slice(0, 200).replace(/\n/g, " ")}`] : [])
+					...(answer ? [`answer (first 200): ${answer.slice(0, 200).replace(/\n/g, " ").trimEnd()}`] : [])
 				]
 			);
 		} else if (isOk(result)) {
 			record(
-				"empty / no-result query",
+				"zero-grounding-sources query",
 				"unverified",
-				`the real API returned ${sources.length} source(s) for the nonsense query — a true zero-result response was not reproducible in this run`,
+				`the real API returned ${sources.length} grounding source(s) for the nonsense query — a zero-grounding-sources response was not reproducible in this run (the zero-source path is covered offline)`,
 				sourceLines(sources, 3)
 			);
 		} else {
 			record(
-				"empty / no-result query",
+				"zero-grounding-sources query",
 				"fail",
 				`expected a successful (possibly empty) result, got ${errorText(result)}`,
 				[`request: ${lastRequest()?.url ?? "(none)"}`]
@@ -551,8 +600,12 @@ function buildReport(creds: { apiKey: string }, versions: Record<string, string>
 		"**Backend (Issue #7 migration):** the previous backend, the Google Custom Search JSON API, is being " +
 			"retired by Google (announced January 2026, retirement 2027-01-01, closed to new customers), so the " +
 			"plugin's backend is the Gemini API `google_search` grounding tool: one API key, no engine id, no " +
-			"separate billing project. The response carries a synthesized answer (mapped to the seam's " +
-			"`content`) and the grounding sources (mapped to the seam's `sources`)."
+			"separate billing project. The response carries a synthesized answer, the grounding sources " +
+			"(evidence for the answer, in response order — not a claimed ranking), the citation relationship " +
+			"(`groundingSupports`), and the model's queries (`webSearchQueries`). The adapter preserves the " +
+			"grounded artifact end to end: the answer with inline citation markers plus the Search suggestions " +
+			"(one Google search link per model query) map to the seam's `content`, and the grounding sources " +
+			"map to the seam's `sources`."
 	);
 	lines.push("");
 	lines.push("## Environment");
@@ -570,11 +623,17 @@ function buildReport(creds: { apiKey: string }, versions: Record<string, string>
 	lines.push(`| Verification date | ${date} |`);
 	lines.push("");
 	lines.push(
-		"The API credential was supplied at runtime from the gitignored `.env.e2e.local` file via the " +
-			"environment-backed reference (`GEMINI_API_KEY`) and was **never** committed, logged, or " +
-			"recorded. Request header values are redacted in this report, and the opaque grounding-redirect " +
-			"tokens in the source URLs are redacted as well. The credential value is checked against the " +
-			"generated report before it is written (the script aborts if it appears)."
+		"**Credential handling (re-review, acceptance 2).** Three API keys were exposed in this issue's " +
+			"conversation logs during earlier verification runs; all three have been invalidated in Google " +
+			"AI Studio. This final run used a **newly created** key that was supplied out of band — " +
+			"written to the gitignored `.env.e2e.local` file (or the terminal environment) and read at " +
+			"runtime via the environment-backed reference (`GEMINI_API_KEY`) — and was never pasted into " +
+			"chat, an issue, a commit message, or this report. The claim below is bounded to the " +
+			"surfaces this script verified: the key value does not appear in this report (the script " +
+			"aborts before writing if it does), it is not present in any tracked file (`.env.e2e.local` " +
+			"is gitignored and the value is never committed), and the request header values in this " +
+			"report are redacted (header *names* are recorded, values are not). No broader logging " +
+			"claim is made about surfaces outside those checks."
 	);
 	lines.push("");
 	lines.push("## Cases");
@@ -613,9 +672,29 @@ function buildReport(creds: { apiKey: string }, versions: Record<string, string>
 	lines.push("");
 	lines.push(
 		"The grounding response also carries `webSearchQueries` (the queries the model actually ran) and " +
-			"`searchEntryPoint` (a rendered Google-search link). These have no field in the DSH seam " +
-			"contract (`WebSearchResult`/`WebSearchSource`), so they are intentionally not mapped — the " +
-			"seam types are the contract, and the adapter does not invent seam fields."
+			"`searchEntryPoint` (a rendered Google-search widget). The DSH seam contract " +
+			"(`WebSearchResult`/`WebSearchSource`) has no dedicated fields for them, so the adapter does " +
+			"not invent seam fields; instead it preserves them through `content` — the Search suggestions " +
+			"section (one Google search link per `webSearchQueries` entry) is appended to the answer, and " +
+			"the citation relationship (`groundingSupports`) becomes inline `[n]` markers resolved against " +
+			"the sources list the tool renders after the answer. Case 1 records the live evidence."
+	);
+	lines.push("");
+	lines.push("## Google grounding display obligations (compliance boundary)");
+	lines.push("");
+	lines.push(
+		"Google's terms for AI-generated grounded content require the associated **Search Suggestions** to " +
+			"be displayed with the grounded results. This plugin's compliance mapping satisfies that " +
+			"obligation at the tool-output boundary: every grounded result that reaches the model carries " +
+			"the Search suggestions (one Google search link per model query) inside `content`, alongside " +
+			"the answer and its citations — so any presentation of the tool output (the rendered text, the " +
+			"structured `content` field, or a downstream model answer built from them) keeps the " +
+			"suggestions attached to the grounded answer. The grounding chunks are **evidence for the " +
+			"generated answer**, not a documented ranked SERP: this report and the plugin's documentation " +
+			"make no ranking claim about them, and the order is the response's chunk order. The " +
+			"`searchEntryPoint.renderedContent` HTML widget itself is not forwarded (it is a " +
+			"Google-branded UI artifact with no seam field); its required substance — the Search " +
+			"suggestions — is preserved as plain markdown links."
 	);
 	lines.push("");
 	lines.push("## What is live evidence vs. offline coverage");
@@ -633,6 +712,13 @@ function buildReport(creds: { apiKey: string }, versions: Record<string, string>
 			"environment). These are asserted by the offline suite and are documented as such rather than " +
 			"claimed as live-verified (acceptance 5)."
 	);
+	lines.push(
+		"- **Unverified (no factual wire evidence exists):** *true zero-result search behavior* — that " +
+			"Google Search executed and found zero results. The wire response for a zero-grounding case " +
+			"carries no `groundingMetadata` and no execution/result-count field: the model may decline to " +
+			"search or answer without attaching grounding, so the safe fact is *zero grounding sources*, " +
+			"not *Google returned zero search results* (acceptance 5, ENGINEERING.md §5)."
+	);
 	lines.push("");
 	lines.push("## Summary");
 	lines.push("");
@@ -641,7 +727,9 @@ function buildReport(creds: { apiKey: string }, versions: Record<string, string>
 			"No credential value appears anywhere in this report (acceptance 2)."
 	);
 	lines.push("");
-	return lines.join("\n");
+	// Normalize line endings: no trailing whitespace in the generated report
+	// (the answer snippets are model text and may end in spaces).
+	return lines.map((line) => line.replace(/\s+$/, "")).join("\n");
 }
 
 // ---------------------------------------------------------------------------

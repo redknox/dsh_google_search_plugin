@@ -1,6 +1,6 @@
 /**
- * Issue #7 acceptance tests (migration) — Gemini grounding response → DSH
- * seam normalization.
+ * Issue #7 acceptance tests (migration, re-review compliance pass) — Gemini
+ * grounding response → DSH seam normalization.
  *
  * These tests assert **conformance to the DSH seam types** (`WebSearchResult`
  * / `WebSearchSource` from `@deepseek-ai/dsh-web`), not to a plugin-local
@@ -14,14 +14,26 @@
  * Acceptance coverage:
  *  - the core mapping contains no parallel result type (it returns seam types);
  *  - required vs optional fields are explicit (`url` required; `title`
- *    optional; `snippet`/`publishedAt` never invented; `content` is the
- *    provider answer, absent when there is none);
+ *    optional; `snippet`/`publishedAt` never invented; `content` carries the
+ *    grounded answer — inline citation markers plus the Search suggestions —
+ *    and is absent when there is nothing to carry);
+ *  - the grounded artifact is preserved end to end: the answer, its citation
+ *    markers (from `groundingSupports`, resolved against the `sources` list
+ *    the DSH tool renders right after `content`), and the Search suggestions
+ *    (one Google search link per `webSearchQueries` entry) all reach the
+ *    seam result — none of them is discarded;
+ *  - the grounding chunks are **evidence, not a claimed ranking**: the
+ *    source order is the response's chunk order, and no test or comment
+ *    asserts a SERP ranking;
  *  - unknown/missing stays unknown/absent (blank optionals are dropped, not
  *    defaulted);
  *  - order is preserved; exact-URL duplicates are deduplicated;
- *  - absent is not malformed: a 200 response without `groundingMetadata`
- *    (Gemini's real zero-result wire shape) is a valid zero-result success,
- *    while a *present* non-array `groundingChunks` is `MALFORMED_RESPONSE`;
+ *  - absent is not malformed, and absent is not "zero search results": a 200
+ *    response without `groundingMetadata` carries *zero grounding sources*
+ *    (the wire does not say whether a search ran and found nothing), while a
+ *    *present* non-array `groundingChunks` is `MALFORMED_RESPONSE`;
+ *  - citation markers are clamped to the seam's `maxResults` bound (a marker
+ *    pointing at a source the seam will truncate would dangle);
  *  - a malformed response is a `WebError`, never a success-shaped result.
  */
 
@@ -29,7 +41,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { WebError, type WebSearchResult, type WebSearchSource } from "@deepseek-ai/dsh-web";
-import { normalizeGeminiSearchResponse } from "../src/provider/normalize.js";
+import {
+	GEMINI_SEARCH_SUGGESTIONS_LABEL,
+	buildGoogleSearchSuggestionUrl,
+	normalizeGeminiSearchResponse
+} from "../src/provider/normalize.js";
 import { GOOGLE_SEARCH_ERROR_CODES } from "../src/provider/errors.js";
 
 // ---------------------------------------------------------------------------
@@ -62,17 +78,29 @@ function assertSeamSourceShape(source: WebSearchSource): void {
 	if ("publishedAt" in source) assert.equal(typeof source.publishedAt, "string");
 }
 
-/** A realistic Gemini grounding success body (wire shape, example URLs). */
-function groundingBody(answer: string, chunks: unknown[]): Record<string, unknown> {
+/**
+ * A realistic Gemini grounding success body (wire shape, example URLs).
+ * Carries `webSearchQueries` (the model's queries → Search suggestions) and,
+ * when `supports` is given, the `groundingSupports` citation relationship.
+ */
+function groundingBody(
+	answer: string,
+	chunks: unknown[],
+	supports?: unknown[]
+): Record<string, unknown> {
+	const metadata: Record<string, unknown> = {
+		groundingChunks: chunks,
+		webSearchQueries: ["deepseek harness"]
+	};
+	if (supports !== undefined) {
+		metadata["groundingSupports"] = supports;
+	}
 	return {
 		candidates: [
 			{
 				content: { parts: [{ text: answer }] },
 				finishReason: "STOP",
-				groundingMetadata: {
-					groundingChunks: chunks,
-					webSearchQueries: ["deepseek harness"]
-				}
+				groundingMetadata: metadata
 			}
 		]
 	};
@@ -86,6 +114,19 @@ function chunk(uri: string, title?: string): Record<string, unknown> {
 	}
 	return { web };
 }
+
+/** One grounding support: an answer segment backed by chunk indices. */
+function support(startIndex: number, endIndex: number, text: string, chunkIndices: number[]): Record<string, unknown> {
+	return {
+		segment: { startIndex, endIndex, text },
+		groundingChunkIndices: chunkIndices
+	};
+}
+
+/** The expected Search-suggestions section for the default fixture queries. */
+const DEFAULT_SUGGESTIONS_SECTION =
+	`${GEMINI_SEARCH_SUGGESTIONS_LABEL}\n` +
+	`- [deepseek harness](${buildGoogleSearchSuggestionUrl("deepseek harness")})`;
 
 // ---------------------------------------------------------------------------
 // Field mapping (Gemini wire fields → seam fields)
@@ -105,12 +146,16 @@ test("normalize: maps groundingChunks web.uri/web.title onto url/title", () => {
 	]);
 });
 
-test("normalize: maps the candidate answer text onto content", () => {
+test("normalize: maps the candidate answer text onto content (with the Search suggestions appended)", () => {
 	const result: WebSearchResult = normalizeGeminiSearchResponse(
 		groundingBody("  The answer text.  ", [chunk("https://example.com/a", "example.com")])
 	);
 	assertSeamResultShape(result);
-	assert.equal(result.content, "The answer text.", "the answer is trimmed and carried as content");
+	assert.equal(
+		result.content,
+		`The answer text.\n\n${DEFAULT_SUGGESTIONS_SECTION}`,
+		"the answer is trimmed, carried as content, followed by the Search suggestions"
+	);
 	assert.equal(result.sources.length, 1);
 });
 
@@ -127,7 +172,7 @@ test("normalize: concatenates multiple answer parts in order", () => {
 	assert.equal(result.content, "Part one. Part two.");
 });
 
-test("normalize: preserves grounding order", () => {
+test("normalize: preserves the response's chunk order (evidence order, not a claimed ranking)", () => {
 	const result: WebSearchResult = normalizeGeminiSearchResponse(
 		groundingBody("Answer.", [
 			chunk("https://example.com/1", "one.example"),
@@ -163,6 +208,177 @@ test("normalize: trims surrounding whitespace on mapped string fields", () => {
 	);
 	assertSeamResultShape(result);
 	assert.deepEqual(result.sources, [{ url: "https://example.com/a", title: "example.com" }]);
+});
+
+// ---------------------------------------------------------------------------
+// Grounded artifact preservation: citations + Search suggestions end to end
+// ---------------------------------------------------------------------------
+
+test("normalize: the Search suggestions section carries one Google search link per webSearchQueries entry", () => {
+	const result: WebSearchResult = normalizeGeminiSearchResponse({
+		candidates: [
+			{
+				content: { parts: [{ text: "Answer." }] },
+				groundingMetadata: {
+					groundingChunks: [chunk("https://example.com/a")],
+					webSearchQueries: ["alpha query", "beta gamma"]
+				}
+			}
+		]
+	});
+	assertSeamResultShape(result);
+	assert.equal(
+		result.content,
+		`Answer.\n\n${GEMINI_SEARCH_SUGGESTIONS_LABEL}\n` +
+			`- [alpha query](${buildGoogleSearchSuggestionUrl("alpha query")})\n` +
+			`- [beta gamma](${buildGoogleSearchSuggestionUrl("beta gamma")})`
+	);
+});
+
+test("normalize: inline citation markers are inserted after each cited answer segment", () => {
+	const answer = "The harness is open source. It runs agents.";
+	const result: WebSearchResult = normalizeGeminiSearchResponse(
+		groundingBody(answer, [
+			chunk("https://example.com/a", "a.example"),
+			chunk("https://example.com/b", "b.example")
+		], [
+			support(0, 25, "The harness is open source.", [0]),
+			support(25, 43, " It runs agents.", [1])
+		])
+	);
+	assertSeamResultShape(result);
+	assert.equal(
+		result.content,
+		`The harness is open source.[1] It runs agents.[2]\n\n${DEFAULT_SUGGESTIONS_SECTION}`,
+		"markers [n] are 1-based into the sources array the tool renders after content"
+	);
+});
+
+test("normalize: a support citing multiple chunks gets a merged marker", () => {
+	const result: WebSearchResult = normalizeGeminiSearchResponse(
+		groundingBody("One fact.", [
+			chunk("https://example.com/a"),
+			chunk("https://example.com/b"),
+			chunk("https://example.com/c")
+		], [support(0, 9, "One fact.", [0, 2])])
+	);
+	assertSeamResultShape(result);
+	assert.ok(result.content!.startsWith("One fact.[1, 3]"), `got: ${result.content}`);
+});
+
+test("normalize: a chunk duplicating an earlier URL cites the first source (dedup rule)", () => {
+	// Chunk 1 duplicates chunk 0's URL, so it maps to source 1 (1-based),
+	// not a second entry — the marker must resolve against the list the
+	// end user sees.
+	const result: WebSearchResult = normalizeGeminiSearchResponse(
+		groundingBody("Fact.", [
+			chunk("https://example.com/a"),
+			chunk("https://example.com/a", "dup.example"),
+			chunk("https://example.com/b")
+		], [support(0, 5, "Fact.", [1])])
+	);
+	assertSeamResultShape(result);
+	assert.equal(result.sources.length, 2, "the duplicate chunk is deduplicated");
+	assert.ok(result.content!.startsWith("Fact.[1]"), `got: ${result.content}`);
+});
+
+test("normalize: citation markers are clamped to maxResults (no dangling markers)", () => {
+	const answer = "First part. Second part.";
+	const supports = [
+		support(0, 12, "First part.", [0]),
+		support(12, 25, " Second part.", [1])
+	];
+	const body = groundingBody(answer, [
+		chunk("https://example.com/1"),
+		chunk("https://example.com/2"),
+		chunk("https://example.com/3")
+	], supports);
+
+	// Without a bound: both markers survive.
+	const unbounded: WebSearchResult = normalizeGeminiSearchResponse(body);
+	assert.ok(unbounded.content!.startsWith("First part.[1] Second part.[2]"), `got: ${unbounded.content}`);
+
+	// With maxResults=1: the seam keeps only the first source, so the marker
+	// citing source 2 is dropped (it would dangle after the seam truncates).
+	const bounded: WebSearchResult = normalizeGeminiSearchResponse(body, 1);
+	assertSeamResultShape(bounded);
+	assert.ok(bounded.content!.startsWith("First part.[1] Second part."), `got: ${bounded.content}`);
+	assert.equal(bounded.truncated, false, "the adapter still reports truncated: false (the seam owns truncation)");
+});
+
+test("normalize: a support whose segments are all truncated away is skipped", () => {
+	const result: WebSearchResult = normalizeGeminiSearchResponse(
+		groundingBody("Only one.", [
+			chunk("https://example.com/1"),
+			chunk("https://example.com/2")
+		], [support(0, 11, "Only one.", [1])]),
+		1
+	);
+	assertSeamResultShape(result);
+	assert.ok(result.content!.startsWith("Only one.\n\n"), `got: ${result.content}`);
+});
+
+test("normalize: a segment the model paraphrased (not found in the answer) is skipped", () => {
+	const result: WebSearchResult = normalizeGeminiSearchResponse(
+		groundingBody("The actual answer.", [chunk("https://example.com/a")], [
+			support(0, 10, "A different wording.", [0])
+		])
+	);
+	assertSeamResultShape(result);
+	assert.ok(result.content!.startsWith("The actual answer.\n\n"), `got: ${result.content}`);
+});
+
+test("normalize: overlapping segments that end at the same point merge their markers", () => {
+	const result: WebSearchResult = normalizeGeminiSearchResponse(
+		groundingBody("Shared fact.", [
+			chunk("https://example.com/a"),
+			chunk("https://example.com/b")
+		], [
+			support(0, 12, "Shared fact.", [0]),
+			support(7, 12, "fact.", [1])
+		])
+	);
+	assertSeamResultShape(result);
+	assert.ok(result.content!.startsWith("Shared fact.[1, 2]"), `got: ${result.content}`);
+});
+
+test("normalize: content carries only the Search suggestions when the answer is absent but queries exist", () => {
+	const result: WebSearchResult = normalizeGeminiSearchResponse({
+		candidates: [
+			{
+				content: { parts: [{ thoughtSignature: "opaque" }] },
+				groundingMetadata: {
+					groundingChunks: [chunk("https://example.com/a")],
+					webSearchQueries: ["lonely query"]
+				}
+			}
+		]
+	});
+	assertSeamResultShape(result);
+	assert.equal(
+		result.content,
+		`${GEMINI_SEARCH_SUGGESTIONS_LABEL}\n- [lonely query](${buildGoogleSearchSuggestionUrl("lonely query")})`
+	);
+});
+
+test("normalize: no webSearchQueries means no suggestions section (answer only)", () => {
+	const result: WebSearchResult = normalizeGeminiSearchResponse({
+		candidates: [
+			{
+				content: { parts: [{ text: "Plain answer." }] },
+				groundingMetadata: { groundingChunks: [chunk("https://example.com/a")] }
+			}
+		]
+	});
+	assertSeamResultShape(result);
+	assert.equal(result.content, "Plain answer.");
+});
+
+test("normalize: buildGoogleSearchSuggestionUrl percent-encodes the query", () => {
+	assert.equal(
+		buildGoogleSearchSuggestionUrl(" 東京 寿司 "),
+		"https://www.google.com/search?q=%E6%9D%B1%E4%BA%AC%20%E5%AF%BF%E5%8F%B8"
+	);
 });
 
 // ---------------------------------------------------------------------------
@@ -210,7 +426,7 @@ test("normalize: publishedAt is never synthesized (the grounding response suppli
 	}
 });
 
-test("normalize: content is absent when the candidate carries no answer text", () => {
+test("normalize: content is absent when the candidate carries no answer text and no queries", () => {
 	const result: WebSearchResult = normalizeGeminiSearchResponse({
 		candidates: [
 			{
@@ -248,15 +464,16 @@ test("normalize: an empty groundingChunks array is a legitimate no-sources succe
 	const result: WebSearchResult = normalizeGeminiSearchResponse(groundingBody("No results found.", []));
 	assertSeamResultShape(result);
 	assert.deepEqual(result.sources, []);
-	assert.equal(result.content, "No results found.");
+	assert.equal(result.content, `No results found.\n\n${DEFAULT_SUGGESTIONS_SECTION}`);
 	assert.equal(result.truncated, false);
 });
 
-test("normalize: a 200 response without groundingMetadata is a valid zero-result success (Gemini's real no-result shape)", () => {
-	// Gemini omits `groundingMetadata` entirely when the search produced no
-	// grounding (a no-result query) — absent is a fact (no results), not a
-	// malformed concrete value (ENGINEERING.md §2). The answer text still
-	// maps to content.
+test("normalize: a 200 response without groundingMetadata carries zero grounding sources (a valid zero-source success)", () => {
+	// Gemini omits `groundingMetadata` entirely when it produced no grounding
+	// for the response. That is the wire fact — *zero grounding sources*. It
+	// is not observable from the wire that a search ran and found zero
+	// results, so the claim stays at the safe level (ENGINEERING.md §2, §5).
+	// The answer text still maps to content.
 	const result: WebSearchResult = normalizeGeminiSearchResponse({
 		candidates: [{ content: { parts: [{ text: "A web search yielded no results." }] }, finishReason: "STOP" }]
 	});
@@ -275,9 +492,9 @@ test("normalize: a candidate without groundingMetadata and without answer text i
 	);
 });
 
-test("normalize: an object response without a candidates field is a valid zero-result success", () => {
+test("normalize: an object response without a candidates field carries zero grounding sources (a valid zero-source success)", () => {
 	// The model produced nothing at all (no candidates): a legitimate
-	// zero-result success, not malformed.
+	// zero-source success, not malformed.
 	for (const body of [{}, { modelVersion: "gemini-3.6-flash" }]) {
 		const result: WebSearchResult = normalizeGeminiSearchResponse(body);
 		assertSeamResultShape(result);
@@ -322,7 +539,7 @@ test("normalize: a non-object body is MALFORMED_RESPONSE", () => {
 });
 
 test("normalize: a present candidates field with a non-array value is MALFORMED_RESPONSE", () => {
-	// Present-but-wrong-typed is malformed; *absent* is a zero-result
+	// Present-but-wrong-typed is malformed; *absent* is a zero-source
 	// success (covered above). The distinction must not collapse.
 	for (const body of [{ candidates: null }, { candidates: "nope" }, { candidates: 42 }, { candidates: { content: {} } }]) {
 		assert.throws(

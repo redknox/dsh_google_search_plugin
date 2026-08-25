@@ -173,7 +173,10 @@ export function buildGoogleSearchProvider(options: GoogleSearchProviderOptions =
 					{
 						apiKey,
 						model: settings.model,
-						query: request.query
+						query: request.query,
+						// Clamps the inline citation markers to the sources the
+						// seam will keep (the seam performs the truncation).
+						...(request.maxResults !== undefined ? { maxResults: request.maxResults } : {})
 					},
 					transport,
 					d.signal

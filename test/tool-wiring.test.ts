@@ -25,8 +25,12 @@
  * the tool contract remains Google-neutral (acceptance 2).
  *
  * Acceptance mapping (issue #5):
- *   1. Harness invokes the tool and receives normalized ranked results
- *        → "single query success", "maxResults bound", "multi-query merge"
+ *   1. Harness invokes the tool and receives normalized grounded results
+ *        (the answer, its citations, the Search suggestions, and the
+ *        grounding sources — in the response's evidence order, not a claimed
+ *        ranking)
+ *        → "single query success", "grounded artifact end to end",
+ *          "maxResults bound", "multi-query merge"
  *   2. Tool contract remains Google-neutral
  *        → "the web_search tool contract is Google-neutral"
  *   3. Raw Google DTOs/errors never cross the provider boundary
@@ -52,6 +56,10 @@ import { CallId } from "@deepseek-ai/dsh-llm";
 
 import { buildGoogleSearchProvider } from "../src/index.js";
 import { GEMINI_API_KEY_ENV } from "../src/provider/config.js";
+import {
+	GEMINI_SEARCH_SUGGESTIONS_LABEL,
+	buildGoogleSearchSuggestionUrl
+} from "../src/provider/normalize.js";
 import {
 	GEMINI_API_KEY_HEADER,
 	GEMINI_SEARCH_DEFAULT_MODEL,
@@ -120,7 +128,11 @@ function geminiSuccessBody(n: number, answer = "The synthesized answer."): strin
 	});
 }
 
-/** A realistic Gemini zero-result body: `groundingMetadata` is ABSENT. */
+/**
+ * A realistic Gemini zero-grounding-sources body: `groundingMetadata` is
+ * ABSENT. The wire fact is "zero grounding sources" — it is not observable
+ * from the wire that a search ran and found nothing.
+ */
 const GEMINI_EMPTY_BODY = JSON.stringify({
 	candidates: [
 		{
@@ -223,10 +235,10 @@ const DEFAULT_TOOL_CONFIG: ToolWebConfig = {
 };
 
 // ---------------------------------------------------------------------------
-// 1. Success: the tool returns normalized, ranked sources
+// 1. Success: the tool returns normalized grounded results
 // ---------------------------------------------------------------------------
 
-test("single query success: the tool returns normalized ranked sources", async () => {
+test("single query success: the tool returns normalized grounded sources (response order, not a claimed ranking)", async () => {
 	const { transport, calls } = makeTransport(async () => ({
 		status: 200,
 		body: geminiSuccessBody(3)
@@ -239,7 +251,8 @@ test("single query success: the tool returns normalized ranked sources", async (
 	const value = result.value as unknown as WebSearchToolValue;
 	assert.equal(value.truncated, false);
 	assert.equal(value.sources.length, 3);
-	// Ranked order is preserved from the provider (grounding order).
+	// The response's chunk order is preserved from the provider (evidence
+	// order — not a claimed SERP ranking).
 	assert.deepEqual(
 		value.sources.map((s) => s.url),
 		["https://example.com/1", "https://example.com/2", "https://example.com/3"]
@@ -249,8 +262,14 @@ test("single query success: the tool returns normalized ranked sources", async (
 		url: "https://example.com/1",
 		title: "example.com/page-1"
 	});
-	// The provider's synthesized answer crosses the seam as `content`.
-	assert.equal(value.content, "The synthesized answer.");
+	// The grounded answer crosses the seam as `content`, followed by the
+	// Search suggestions (one Google search link per webSearchQueries entry) —
+	// the grounded artifact is preserved end to end, not discarded.
+	assert.equal(
+		value.content,
+		`The synthesized answer.\n\n${GEMINI_SEARCH_SUGGESTIONS_LABEL}\n` +
+			`- [deepseek harness](${buildGoogleSearchSuggestionUrl("deepseek harness")})`
+	);
 
 	// The request went through the seam to exactly one Gemini call, with the
 	// documented grounding request shape.
@@ -265,6 +284,59 @@ test("single query success: the tool returns normalized ranked sources", async (
 	// The grounding API has no per-request result-count control: the tool's
 	// `searchMaxResults` bound is enforced by the seam on the way back.
 	assert.equal(body["num"], undefined, "no result-count parameter exists in the grounding API");
+});
+
+test("grounded artifact end to end: citations and Search suggestions reach the tool output", async () => {
+	// The full grounding wire shape: an answer, two evidence chunks, the
+	// citation relationship (groundingSupports), and the model's queries.
+	// The tool output must carry the answer with inline citation markers
+	// resolved against the sources list the tool renders after `content`,
+	// plus the Search suggestions — the complete grounded artifact, not just
+	// a bare source list.
+	const body = JSON.stringify({
+		candidates: [
+			{
+				content: {
+					parts: [{ text: "The harness is open source. It runs agents." }]
+				},
+				finishReason: "STOP",
+				groundingMetadata: {
+					groundingChunks: [
+						{ web: { uri: "https://example.com/a", title: "a.example" } },
+						{ web: { uri: "https://example.com/b", title: "b.example" } }
+					],
+					groundingSupports: [
+						{ segment: { startIndex: 0, endIndex: 25, text: "The harness is open source." }, groundingChunkIndices: [0] },
+						{ segment: { startIndex: 25, endIndex: 43, text: " It runs agents." }, groundingChunkIndices: [1] }
+					],
+					webSearchQueries: ["deepseek harness"]
+				}
+			}
+		]
+	});
+	const { transport } = makeTransport(async () => ({ status: 200, body }));
+	const ctx = await buildHarness(transport, DEFAULT_TOOL_CONFIG);
+
+	const result = await runWebSearch(ctx, ["deepseek harness"], new AbortController().signal);
+	assert.equal(result.isError, false, `expected success, got: ${JSON.stringify(result.error)}`);
+	const value = result.value as unknown as WebSearchToolValue;
+	assert.equal(value.sources.length, 2);
+	// The answer keeps its citation markers, 1-based into the sources list.
+	assert.equal(
+		value.content,
+		`The harness is open source.[1] It runs agents.[2]\n\n${GEMINI_SEARCH_SUGGESTIONS_LABEL}\n` +
+			`- [deepseek harness](${buildGoogleSearchSuggestionUrl("deepseek harness")})`
+	);
+	// The tool's rendered text (what the end user sees — the `render`
+	// projection of the canonical value) carries the answer, the citations,
+	// the sources list, and the Search suggestions together.
+	const rendered = (result.content as { type: string; text?: string }[])
+		.filter((block) => block.type === "text")
+		.map((block) => block.text ?? "")
+		.join("\n");
+	assert.ok(rendered.includes("The harness is open source.[1]"), "the citation markers reach the rendered output");
+	assert.ok(rendered.includes(GEMINI_SEARCH_SUGGESTIONS_LABEL), "the Search suggestions reach the rendered output");
+	assert.ok(rendered.includes("https://example.com/a"), "the sources list reaches the rendered output");
 });
 
 test("maxResults bound: the seam truncates an over-returning provider and flags it", async () => {
@@ -283,7 +355,7 @@ test("maxResults bound: the seam truncates an over-returning provider and flags 
 	assert.equal(value.truncated, true, "the seam flags the truncated result");
 });
 
-test("multi-query merge: concurrent queries are deduped, ranked round-robin, and capped", async () => {
+test("multi-query merge: concurrent queries are deduped, merged round-robin, and capped", async () => {
 	// Two queries; the second returns a source the first also returned (same
 	// url) to exercise dedup, plus a fresh one.
 	let queryIndex = 0;
@@ -325,7 +397,8 @@ test("multi-query merge: concurrent queries are deduped, ranked round-robin, and
 	const result = await runWebSearch(ctx, ["alpha", "beta"], new AbortController().signal);
 	assert.equal(result.isError, false, `expected success, got: ${JSON.stringify(result.error)}`);
 	const value = result.value as unknown as WebSearchToolValue;
-	// Round-robin by rank: a1, shared, b1 (the duplicate shared is dropped).
+	// Round-robin by response position: a1, shared, b1 (the duplicate
+	// shared is dropped).
 	assert.deepEqual(
 		value.sources.map((s) => s.url),
 		["https://example.com/a1", "https://example.com/shared", "https://example.com/b1"]
@@ -444,7 +517,9 @@ test("provider failure: quota and rate-limit map to their stable shared codes", 
 // 6 (success/empty paths): empty results are a success, not an error
 // ---------------------------------------------------------------------------
 
-test("empty results: a zero-result Gemini response is a successful empty result", async () => {
+test("empty results: a zero-grounding-sources Gemini response is a successful empty result", async () => {
+	// The wire fact is zero grounding sources (absent `groundingMetadata`);
+	// the answer text still crosses the seam as `content`.
 	const { transport } = makeTransport(async () => ({ status: 200, body: GEMINI_EMPTY_BODY }));
 	const ctx = await buildHarness(transport, DEFAULT_TOOL_CONFIG);
 
@@ -453,6 +528,7 @@ test("empty results: a zero-result Gemini response is a successful empty result"
 	const value = result.value as unknown as WebSearchToolValue;
 	assert.deepEqual(value.sources, []);
 	assert.equal(value.truncated, false);
+	assert.equal(value.content, "A web search yielded no results.");
 });
 
 // ---------------------------------------------------------------------------
