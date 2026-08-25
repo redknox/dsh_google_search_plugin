@@ -25,26 +25,50 @@
  *     it;
  *   - `groundingMetadata.groundingSupports[]` — the citation relationship:
  *     which segments of the answer are supported by which chunks;
- *   - `groundingMetadata.webSearchQueries[]` — the queries the model ran,
- *     i.e. the basis for the Search Suggestions Google's display terms
- *     require to accompany grounded results.
+ *   - `groundingMetadata.searchEntryPoint.renderedContent` — the
+ *     **provider-supplied Search Suggestion artifact**: a rendered HTML+CSS
+ *     snippet that Google's terms require to be displayed together with the
+ *     grounded results. This is the Search Suggestion. It is distinct from
+ *     `webSearchQueries` (the queries the model executed); Google's
+ *     documentation treats the executed queries and the rendered
+ *     search-suggestion artifact as different things, and the terms say the
+ *     artifact is not to be modified. This adapter therefore preserves it
+ *     **verbatim** and does **not** reconstruct a replacement from
+ *     `webSearchQueries`.
+ *   - `groundingMetadata.webSearchQueries[]` — the queries the model ran.
+ *     These are *not* the Search Suggestion; this adapter does not turn them
+ *     into display links (doing so would fabricate a suggestion Google did
+ *     not supply).
  *
  * The DSH seam types have no dedicated fields for the citation relationship
- * or the Search Suggestions. Rather than discarding them (which would leave
- * the runtime without a compliant presentation path and would separate the
- * answer from its citations), this adapter preserves the grounded artifact
+ * or the Search Suggestion. This adapter preserves the grounded artifact
  * **end to end through the fields the seam does have**:
  *
  *   - `content` = the answer with **inline citation markers** `[n]` appended
  *     after each cited segment (1-based `n` into the `sources` array, which
  *     the DSH tool renders immediately after `content` as its "Sources:"
  *     list — so the markers resolve against the list the end user sees),
- *     followed by a **Search suggestions** section carrying one Google
- *     search link per `webSearchQueries` entry. The answer, its citations,
- *     and the Search Suggestions therefore reach the end user together.
+ *     followed by the **provider-supplied Search Suggestion artifact
+ *     verbatim** (`searchEntryPoint.renderedContent`, the HTML+CSS snippet,
+ *     carried byte-for-byte).
  *   - `sources` = the grounding chunks (deduplicated by exact URL, first
  *     occurrence wins), in the order the response carries them. The order is
  *     *response order*, not a claimed ranking.
+ *
+ * **Host-contract boundary (what the seam can and cannot do).** The seam
+ * carries `content` as an inert **string** into the model context, so the
+ * provider artifact is preserved verbatim and is never lost or rewritten.
+ * But the DSH `web_search` tool renders its result as **plain text only**
+ * (its `render` returns `{ type: "text" }` blocks; there is no HTML/CSS
+ * presentation channel), so the supplied HTML+CSS Search Suggestion is
+ * carried to the model context but **not rendered as a search widget to the
+ * end user who submitted the prompt**. That is a **host-contract blocker**,
+ * not a compliance achievement: this plugin does **not** claim that Google's
+ * "display the Search Suggestions with the grounded results" obligation is
+ * satisfied at the end-user boundary. Whether a downstream model reproduces
+ * the artifact in its own answer is not guaranteed by this seam. The
+ * obligation, and the seam's inability to render the artifact, are recorded
+ * in ARCHITECTURE.md and in the E2E report.
  *
  * Fields the seam defines but Gemini does **not** supply are left **absent**,
  * never invented:
@@ -82,13 +106,13 @@
 import { WebError, type WebSearchResult, type WebSearchSource } from "@deepseek-ai/dsh-web";
 import { GOOGLE_SEARCH_ERROR_CODES } from "./errors.js";
 
-/** The label the Search-suggestions section in `content` carries. */
-export const GEMINI_SEARCH_SUGGESTIONS_LABEL = "Search suggestions:";
-
-/** Build the Google search URL for one grounded search query. */
-export function buildGoogleSearchSuggestionUrl(query: string): string {
-	return `https://www.google.com/search?q=${encodeURIComponent(query.trim())}`;
-}
+/**
+ * The label that introduces the provider-supplied Search Suggestion artifact
+ * inside `content`. The label is this adapter's own framing; the artifact
+ * that follows it is Google's `searchEntryPoint.renderedContent`, carried
+ * verbatim (never rewritten, reconstructed, or replaced).
+ */
+export const GEMINI_SEARCH_SUGGESTION_LABEL = "Search suggestion (provider-supplied, verbatim):";
 
 /**
  * Normalize a parsed Gemini API `generateContent` response body (with the
@@ -103,10 +127,11 @@ export function buildGoogleSearchSuggestionUrl(query: string): string {
  * @returns a `WebSearchResult` whose `sources` preserve the response's
  *   grounding-chunk order (deduplicated by exact URL — response order, not a
  *   claimed ranking), with `truncated: false` (the seam owns truncation) and
- *   the grounded answer — inline citation markers plus the Search
- *   suggestions — as `content` when present. A response without
- *   `candidates`, or with no `groundingMetadata` (zero grounding sources),
- *   is a legitimate zero-source success.
+ *   the grounded answer — inline citation markers plus the
+ *   provider-supplied Search Suggestion artifact verbatim — as `content`
+ *   when present. A response without `candidates`, or with no
+ *   `groundingMetadata` (zero grounding sources), is a legitimate
+ *   zero-source success.
  * @throws {WebError} with code `MALFORMED_RESPONSE` when the body is not an
  *   object, when `candidates` is present with a non-array value, when a
  *   candidate is present but yields neither answer text nor usable sources,
@@ -158,10 +183,20 @@ export function normalizeGeminiSearchResponse(
 
 /**
  * Assemble the grounded `content`: the answer with inline citation markers
- * (from `groundingSupports`) and the Search suggestions (from
- * `webSearchQueries`) appended. Returns `undefined` when there is no answer
- * text and no suggestions (a sources-only response keeps `content` absent,
- * matching the seam's optional-field discipline).
+ * (from `groundingSupports`), followed by the **provider-supplied Search
+ * Suggestion artifact verbatim** (`searchEntryPoint.renderedContent`).
+ * Returns `undefined` when there is no answer text and no artifact (a
+ * sources-only response keeps `content` absent, matching the seam's
+ * optional-field discipline).
+ *
+ * The artifact is carried byte-for-byte. It is **not** reconstructed from
+ * `webSearchQueries` (the executed queries are a different field, and turning
+ * them into display links would fabricate a suggestion Google did not supply)
+ * and **not** sanitized, stripped, or otherwise modified (Google's terms say
+ * the supplied Search Suggestion is not to be modified). The seam carries it
+ * as an inert string into the model context; rendering it as a search widget
+ * to the end user is a host-contract blocker, documented elsewhere — not
+ * something this adapter decides.
  */
 function buildGroundedContent(
 	candidate: Record<string, unknown>,
@@ -171,12 +206,9 @@ function buildGroundedContent(
 ): string | undefined {
 	const metadata = candidate["groundingMetadata"];
 	const supports = isPlainObject(metadata) ? metadata["groundingSupports"] : undefined;
-	const rawQueries = isPlainObject(metadata) ? metadata["webSearchQueries"] : undefined;
-	const queries = Array.isArray(rawQueries)
-		? rawQueries.filter((q): q is string => typeof q === "string" && q.trim().length > 0)
-		: [];
+	const suggestion = extractSearchSuggestion(candidate);
 
-	if (answer === undefined && queries.length === 0) {
+	if (answer === undefined && suggestion === undefined) {
 		return undefined;
 	}
 
@@ -195,9 +227,9 @@ function buildGroundedContent(
 	if (marked.length > 0) {
 		parts.push(marked);
 	}
-	if (queries.length > 0) {
-		const lines = queries.map((q) => `- [${q.trim()}](${buildGoogleSearchSuggestionUrl(q)})`);
-		parts.push(`${GEMINI_SEARCH_SUGGESTIONS_LABEL}\n${lines.join("\n")}`);
+	if (suggestion !== undefined) {
+		// The provider artifact, verbatim, introduced by our own label.
+		parts.push(`${GEMINI_SEARCH_SUGGESTION_LABEL}\n${suggestion}`);
 	}
 	const joined = parts.join("\n\n").trim();
 	return joined.length > 0 ? joined : undefined;
@@ -235,6 +267,38 @@ function buildChunkToSourceMap(candidate: Record<string, unknown>): Map<number, 
 		}
 	}
 	return mapping;
+}
+
+/**
+ * Extract the provider-supplied Search Suggestion artifact
+ * (`groundingMetadata.searchEntryPoint.renderedContent`) verbatim, or
+ * `undefined` when the response carries none.
+ *
+ * The value is returned exactly as the wire sent it — no trimming of the
+ * HTML, no rewriting, no reconstruction from `webSearchQueries`. A
+ * `searchEntryPoint` that is present but whose `renderedContent` is not a
+ * non-blank string is treated as *absent* (the artifact simply was not
+ * supplied), not as malformed: a grounded response without a rendered
+ * suggestion is still a usable grounded response, and inventing a
+ * replacement would be worse than carrying none.
+ */
+function extractSearchSuggestion(candidate: Record<string, unknown>): string | undefined {
+	const metadata = candidate["groundingMetadata"];
+	if (!isPlainObject(metadata)) {
+		return undefined;
+	}
+	const entryPoint = metadata["searchEntryPoint"];
+	if (!isPlainObject(entryPoint)) {
+		return undefined;
+	}
+	const rendered = entryPoint["renderedContent"];
+	// A non-string or blank artifact is treated as absent (the provider
+	// simply supplied nothing to render). A non-blank artifact is returned
+	// exactly as sent — no trimming, no rewriting.
+	if (typeof rendered !== "string" || rendered.trim().length === 0) {
+		return undefined;
+	}
+	return rendered;
 }
 
 /** The usable `web.uri` of a grounding chunk, or `undefined`. */

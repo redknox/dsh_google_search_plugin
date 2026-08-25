@@ -26,11 +26,19 @@
  *
  * Acceptance mapping (issue #5):
  *   1. Harness invokes the tool and receives normalized grounded results
- *        (the answer, its citations, the Search suggestions, and the
- *        grounding sources — in the response's evidence order, not a claimed
- *        ranking)
+ *        (the answer, its citations, the provider-supplied Search Suggestion
+ *        artifact preserved verbatim, and the grounding sources — in the
+ *        response's evidence order, not a claimed ranking)
  *        → "single query success", "grounded artifact end to end",
  *          "maxResults bound", "multi-query merge"
+ *
+ * The "grounded artifact end to end" test asserts that the provider-supplied
+ * `searchEntryPoint.renderedContent` artifact survives to the tool output
+ * (the model-context boundary). It does NOT assert that the artifact is
+ * rendered as a search widget to the end user: the DSH seam renders tool
+ * output as plain text only (no HTML/CSS channel), so that display boundary
+ * is a host-contract blocker, documented in ARCHITECTURE.md and the E2E
+ * report — not something this offline suite can establish.
  *   2. Tool contract remains Google-neutral
  *        → "the web_search tool contract is Google-neutral"
  *   3. Raw Google DTOs/errors never cross the provider boundary
@@ -56,10 +64,7 @@ import { CallId } from "@deepseek-ai/dsh-llm";
 
 import { buildGoogleSearchProvider } from "../src/index.js";
 import { GEMINI_API_KEY_ENV } from "../src/provider/config.js";
-import {
-	GEMINI_SEARCH_SUGGESTIONS_LABEL,
-	buildGoogleSearchSuggestionUrl
-} from "../src/provider/normalize.js";
+import { GEMINI_SEARCH_SUGGESTION_LABEL } from "../src/provider/normalize.js";
 import {
 	GEMINI_API_KEY_HEADER,
 	GEMINI_SEARCH_DEFAULT_MODEL,
@@ -112,6 +117,16 @@ function queryOf(request: GeminiSearchHttpRequest): string {
 	return text.slice(GEMINI_SEARCH_PROMPT_TEMPLATE.length);
 }
 
+/**
+ * A stand-in for the provider-supplied Search Suggestion artifact
+ * (`searchEntryPoint.renderedContent`): an HTML+CSS snippet, exactly as the
+ * wire carries it (the live artifact is a styled widget; this is a minimal
+ * stand-in with the same shape — HTML, not a URL).
+ */
+export const FAKE_RENDERED_CONTENT =
+	'<style>\n.chip { display: inline-block; border-radius: 16px; }\n</style>\n' +
+	'<div class="container"><a class="chip" href="https://www.google.com/search?q=deepseek+harness&amp;client=app-vertex-grounding">deepseek harness</a></div>';
+
 /** A realistic Gemini grounding success body with `n` grounding chunks. */
 function geminiSuccessBody(n: number, answer = "The synthesized answer."): string {
 	const chunks = Array.from({ length: n }, (_, i) => ({
@@ -122,7 +137,11 @@ function geminiSuccessBody(n: number, answer = "The synthesized answer."): strin
 			{
 				content: { parts: [{ text: answer }] },
 				finishReason: "STOP",
-				groundingMetadata: { groundingChunks: chunks, webSearchQueries: ["deepseek harness"] }
+				groundingMetadata: {
+					groundingChunks: chunks,
+					searchEntryPoint: { renderedContent: FAKE_RENDERED_CONTENT },
+					webSearchQueries: ["deepseek harness"]
+				}
 			}
 		]
 	});
@@ -263,13 +282,9 @@ test("single query success: the tool returns normalized grounded sources (respon
 		title: "example.com/page-1"
 	});
 	// The grounded answer crosses the seam as `content`, followed by the
-	// Search suggestions (one Google search link per webSearchQueries entry) —
-	// the grounded artifact is preserved end to end, not discarded.
-	assert.equal(
-		value.content,
-		`The synthesized answer.\n\n${GEMINI_SEARCH_SUGGESTIONS_LABEL}\n` +
-			`- [deepseek harness](${buildGoogleSearchSuggestionUrl("deepseek harness")})`
-	);
+	// provider-supplied Search Suggestion artifact verbatim — the grounded
+	// artifact is preserved end to end, not discarded or reconstructed.
+	assert.equal(value.content, `The synthesized answer.\n\n${GEMINI_SEARCH_SUGGESTION_LABEL}\n${FAKE_RENDERED_CONTENT}`);
 
 	// The request went through the seam to exactly one Gemini call, with the
 	// documented grounding request shape.
@@ -286,13 +301,15 @@ test("single query success: the tool returns normalized grounded sources (respon
 	assert.equal(body["num"], undefined, "no result-count parameter exists in the grounding API");
 });
 
-test("grounded artifact end to end: citations and Search suggestions reach the tool output", async () => {
+test("grounded artifact end to end: the provider-supplied Search Suggestion reaches the tool output verbatim", async () => {
 	// The full grounding wire shape: an answer, two evidence chunks, the
-	// citation relationship (groundingSupports), and the model's queries.
-	// The tool output must carry the answer with inline citation markers
-	// resolved against the sources list the tool renders after `content`,
-	// plus the Search suggestions — the complete grounded artifact, not just
-	// a bare source list.
+	// citation relationship (groundingSupports), the executed queries, and
+	// the provider-supplied Search Suggestion artifact
+	// (`searchEntryPoint.renderedContent`). The tool output must carry the
+	// answer with inline citation markers resolved against the sources list
+	// the tool renders after `content`, plus the provider artifact
+	// **verbatim** — the complete grounded artifact, not just a bare source
+	// list, and not a reconstruction from `webSearchQueries`.
 	const body = JSON.stringify({
 		candidates: [
 			{
@@ -309,7 +326,8 @@ test("grounded artifact end to end: citations and Search suggestions reach the t
 						{ segment: { startIndex: 0, endIndex: 25, text: "The harness is open source." }, groundingChunkIndices: [0] },
 						{ segment: { startIndex: 25, endIndex: 43, text: " It runs agents." }, groundingChunkIndices: [1] }
 					],
-					webSearchQueries: ["deepseek harness"]
+					webSearchQueries: ["deepseek harness"],
+					searchEntryPoint: { renderedContent: FAKE_RENDERED_CONTENT }
 				}
 			}
 		]
@@ -321,22 +339,24 @@ test("grounded artifact end to end: citations and Search suggestions reach the t
 	assert.equal(result.isError, false, `expected success, got: ${JSON.stringify(result.error)}`);
 	const value = result.value as unknown as WebSearchToolValue;
 	assert.equal(value.sources.length, 2);
-	// The answer keeps its citation markers, 1-based into the sources list.
+	// The answer keeps its citation markers, 1-based into the sources list,
+	// and the provider artifact is appended verbatim.
 	assert.equal(
 		value.content,
-		`The harness is open source.[1] It runs agents.[2]\n\n${GEMINI_SEARCH_SUGGESTIONS_LABEL}\n` +
-			`- [deepseek harness](${buildGoogleSearchSuggestionUrl("deepseek harness")})`
+		`The harness is open source.[1] It runs agents.[2]\n\n${GEMINI_SEARCH_SUGGESTION_LABEL}\n${FAKE_RENDERED_CONTENT}`
 	);
-	// The tool's rendered text (what the end user sees — the `render`
-	// projection of the canonical value) carries the answer, the citations,
-	// the sources list, and the Search suggestions together.
+	// The tool's projected text (the `render` output — the model-context
+	// boundary) carries the answer, the citations, the sources list, and the
+	// provider artifact together. This is the presentation boundary this
+	// offline suite can assert; rendering the HTML as a widget to the end
+	// user is a host-contract blocker (the seam renders plain text only).
 	const rendered = (result.content as { type: string; text?: string }[])
 		.filter((block) => block.type === "text")
 		.map((block) => block.text ?? "")
 		.join("\n");
-	assert.ok(rendered.includes("The harness is open source.[1]"), "the citation markers reach the rendered output");
-	assert.ok(rendered.includes(GEMINI_SEARCH_SUGGESTIONS_LABEL), "the Search suggestions reach the rendered output");
-	assert.ok(rendered.includes("https://example.com/a"), "the sources list reaches the rendered output");
+	assert.ok(rendered.includes("The harness is open source.[1]"), "the citation markers reach the projected output");
+	assert.ok(rendered.includes(FAKE_RENDERED_CONTENT), "the provider artifact reaches the projected output verbatim");
+	assert.ok(rendered.includes("https://example.com/a"), "the sources list reaches the projected output");
 });
 
 test("maxResults bound: the seam truncates an over-returning provider and flags it", async () => {

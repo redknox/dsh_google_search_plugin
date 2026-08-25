@@ -33,8 +33,9 @@
  *
  * Cases (issue #7 tasks):
  *   1. ordinary query              → normalized live results, with the
- *      grounded artifact (answer + citations + Search suggestions) preserved
- *      end to end (acceptance 1)
+ *      grounded artifact (answer + citations + the provider-supplied Search
+ *      Suggestion artifact, `searchEntryPoint.renderedContent`, preserved
+ *      verbatim) carried to the tool output (acceptance 1)
  *   2. zero-grounding-sources query → success with zero sources (the wire
  *      fact is "zero grounding sources", not "Google returned zero search
  *      results")
@@ -72,6 +73,7 @@ import {
 	GEMINI_SEARCH_PROMPT_TEMPLATE,
 	scrubUrlTokens
 } from "../src/provider/transport.js";
+import { GEMINI_SEARCH_SUGGESTION_LABEL } from "../src/provider/normalize.js";
 
 /** The plugin's composition-input config (the schema's input type, partial). */
 type PluginConfigInput = Parameters<typeof Config>[0];
@@ -141,6 +143,14 @@ interface RecordedRequest {
 	query: string | undefined;
 	/** The `tools` array from the JSON request body. */
 	tools: unknown;
+	/**
+	 * The provider-supplied Search Suggestion artifact
+	 * (`groundingMetadata.searchEntryPoint.renderedContent`) extracted from
+	 * the LIVE response of this request — the exact string the provider sent,
+	 * used to prove it survives verbatim to the tool output. Absent when the
+	 * response carried no artifact.
+	 */
+	suggestionArtifact: string | undefined;
 }
 
 const recorded: RecordedRequest[] = [];
@@ -177,8 +187,27 @@ function installFetchObserver(): void {
 				// Non-JSON body: nothing to extract.
 			}
 		}
-		recorded.push({ url: scrubUrlTokens(url), headerNames, query, tools });
-		return realFetch(input, init);
+		const response = await realFetch(input, init);
+		let suggestionArtifact: string | undefined;
+		// Read a copy of the response body (the original stream is untouched)
+		// to capture the provider-supplied Search Suggestion artifact from the
+		// live response, so the report can prove the exact string the provider
+		// sent is the one that survives to the tool output.
+		try {
+			const clone = response.clone();
+			const text = await clone.text();
+			const parsed = JSON.parse(text) as {
+				candidates?: { groundingMetadata?: { searchEntryPoint?: { renderedContent?: unknown } } }[];
+			};
+			const rendered = parsed.candidates?.[0]?.groundingMetadata?.searchEntryPoint?.renderedContent;
+			if (typeof rendered === "string" && rendered.trim().length > 0) {
+				suggestionArtifact = rendered;
+			}
+		} catch {
+			// Non-JSON or unclonable body: nothing to capture.
+		}
+		recorded.push({ url: scrubUrlTokens(url), headerNames, query, tools, suggestionArtifact });
+		return response;
 	}) as typeof fetch;
 }
 
@@ -317,23 +346,37 @@ function answerOf(result: ToolExecutionResult): string | undefined {
 
 /**
  * Check the grounded artifact in a successful result: the `content` must
- * carry the Search suggestions section (the compliance mapping of
- * `webSearchQueries`), and — when the response carried grounding sources —
- * inline citation markers `[n]` resolved against the sources list. Returns
- * the evidence lines (or the failure reason).
+ * carry the provider-supplied Search Suggestion artifact
+ * (`searchEntryPoint.renderedContent`) **verbatim** — the exact HTML string
+ * the live response carried, not a reconstruction from `webSearchQueries` —
+ * and, when the response carried grounding sources, inline citation markers
+ * `[n]` resolved against the sources list. Returns the evidence lines (or
+ * the failure reason).
  */
-function groundedArtifactEvidence(result: ToolExecutionResult, sources: SourceShape[]): { ok: boolean; lines: string[] } {
+function groundedArtifactEvidence(
+	result: ToolExecutionResult,
+	sources: SourceShape[],
+	liveArtifact: string | undefined
+): { ok: boolean; lines: string[] } {
 	const answer = answerOf(result);
 	const lines: string[] = [];
 	if (answer === undefined) {
 		return { ok: false, lines: ["no answer text in the result content"] };
 	}
-	const hasSuggestions = answer.includes("Search suggestions:");
-	const hasGoogleSuggestionLink = /Search suggestions:[\s\S]*https:\/\/www\.google\.com\/search\?q=/.test(answer);
-	lines.push(
-		`answer carries the Search suggestions section: ${hasSuggestions ? "yes" : "NO"} ` +
-			`(one Google search link per model query: ${hasGoogleSuggestionLink ? "yes" : "NO"})`
-	);
+	if (liveArtifact === undefined) {
+		lines.push("the live response carried no provider-supplied Search Suggestion artifact (nothing to verify)");
+	} else {
+		const labelPresent = answer.includes(GEMINI_SEARCH_SUGGESTION_LABEL);
+		const verbatim = answer.includes(liveArtifact);
+		lines.push(
+			`the provider-supplied Search Suggestion artifact (renderedContent, ${liveArtifact.length} chars of HTML) ` +
+				`survives to the tool output verbatim: ${verbatim ? "yes" : "NO"} ` +
+				`(section label present: ${labelPresent ? "yes" : "NO"})`
+		);
+		lines.push(
+			`artifact head (first 120 chars, verbatim): ${JSON.stringify(liveArtifact.slice(0, 120))}`
+		);
+	}
 	if (sources.length > 0) {
 		const markerCount = (answer.match(/\[\d+(?:, ?\d+)*\]/g) ?? []).length;
 		lines.push(
@@ -341,7 +384,7 @@ function groundedArtifactEvidence(result: ToolExecutionResult, sources: SourceSh
 				`(1-based into the ${sources.length} source(s) the tool renders after the answer)`
 		);
 	}
-	return { ok: hasSuggestions && hasGoogleSuggestionLink, lines };
+	return { ok: liveArtifact === undefined || answer.includes(liveArtifact), lines };
 }
 
 function errorText(result: ToolExecutionResult): string {
@@ -364,12 +407,12 @@ async function runBehaviorCases(): Promise<void> {
 		const req = lastRequest();
 		const sources = sourcesOf(result);
 		const answer = answerOf(result);
-		const artifact = groundedArtifactEvidence(result, sources);
+		const artifact = groundedArtifactEvidence(result, sources, req?.suggestionArtifact);
 		if (isOk(result) && sources.length > 0 && req !== undefined && artifact.ok) {
 			record(
 				"ordinary query",
 				"pass",
-				`returned ${sources.length} normalized live source(s) and a synthesized answer; the grounded artifact (answer + citations + Search suggestions) is preserved end to end`,
+				`returned ${sources.length} normalized live source(s) and a synthesized answer; the grounded artifact (answer + citations + the provider-supplied Search Suggestion artifact, verbatim) is carried to the tool output`,
 				[
 					`request: POST ${req.url}`,
 					`headers: ${req.headerNames.join(", ")} (values redacted)`,
@@ -602,9 +645,10 @@ function buildReport(creds: { apiKey: string }, versions: Record<string, string>
 			"plugin's backend is the Gemini API `google_search` grounding tool: one API key, no engine id, no " +
 			"separate billing project. The response carries a synthesized answer, the grounding sources " +
 			"(evidence for the answer, in response order — not a claimed ranking), the citation relationship " +
-			"(`groundingSupports`), and the model's queries (`webSearchQueries`). The adapter preserves the " +
-			"grounded artifact end to end: the answer with inline citation markers plus the Search suggestions " +
-			"(one Google search link per model query) map to the seam's `content`, and the grounding sources " +
+			"(`groundingSupports`), the model's executed queries (`webSearchQueries`), and the provider-" +
+			"supplied Search Suggestion artifact (`searchEntryPoint.renderedContent`, an HTML+CSS snippet). " +
+			"The adapter carries the grounded artifact end to end: the answer with inline citation markers " +
+			"plus the provider artifact **verbatim** map to the seam's `content`, and the grounding sources " +
 			"map to the seam's `sources`."
 	);
 	lines.push("");
@@ -672,29 +716,56 @@ function buildReport(creds: { apiKey: string }, versions: Record<string, string>
 	lines.push("");
 	lines.push(
 		"The grounding response also carries `webSearchQueries` (the queries the model actually ran) and " +
-			"`searchEntryPoint` (a rendered Google-search widget). The DSH seam contract " +
-			"(`WebSearchResult`/`WebSearchSource`) has no dedicated fields for them, so the adapter does " +
-			"not invent seam fields; instead it preserves them through `content` — the Search suggestions " +
-			"section (one Google search link per `webSearchQueries` entry) is appended to the answer, and " +
-			"the citation relationship (`groundingSupports`) becomes inline `[n]` markers resolved against " +
-			"the sources list the tool renders after the answer. Case 1 records the live evidence."
+			"`searchEntryPoint.renderedContent` (the provider-supplied Search Suggestion artifact — an " +
+			"HTML+CSS snippet the provider renders as a Google-branded search-suggestion widget). The DSH " +
+			"seam contract (`WebSearchResult`/`WebSearchSource`) has no dedicated fields for either, so the " +
+			"adapter does not invent seam fields: the provider artifact is appended to the answer inside " +
+			"`content` **verbatim** (case 1 records the live evidence that the exact string the response " +
+			"carried survives to the tool output), and the citation relationship (`groundingSupports`) " +
+			"becomes inline `[n]` markers resolved against the sources list the tool renders after the " +
+			"answer. `webSearchQueries` is a separate field (the executed queries); it is **not** used to " +
+			"reconstruct or replace the artifact."
 	);
 	lines.push("");
-	lines.push("## Google grounding display obligations (compliance boundary)");
+	lines.push("## Presentation boundary: what the plugin does and does not claim");
 	lines.push("");
 	lines.push(
 		"Google's terms for AI-generated grounded content require the associated **Search Suggestions** to " +
-			"be displayed with the grounded results. This plugin's compliance mapping satisfies that " +
-			"obligation at the tool-output boundary: every grounded result that reaches the model carries " +
-			"the Search suggestions (one Google search link per model query) inside `content`, alongside " +
-			"the answer and its citations — so any presentation of the tool output (the rendered text, the " +
-			"structured `content` field, or a downstream model answer built from them) keeps the " +
-			"suggestions attached to the grounded answer. The grounding chunks are **evidence for the " +
-			"generated answer**, not a documented ranked SERP: this report and the plugin's documentation " +
-			"make no ranking claim about them, and the order is the response's chunk order. The " +
-			"`searchEntryPoint.renderedContent` HTML widget itself is not forwarded (it is a " +
-			"Google-branded UI artifact with no seam field); its required substance — the Search " +
-			"suggestions — is preserved as plain markdown links."
+			"be displayed with the grounded results. This plugin's position is deliberately bounded: it " +
+			"**preserves** the provider-supplied artifact verbatim and carries it to the tool output " +
+			"(the model-context boundary), but it does **not** claim the display obligation is satisfied. " +
+			"The DSH seam (`@deepseek-ai/dsh-tool-web`) renders `web_search` output as plain text only — " +
+			"the tool's `render` projection returns text blocks and `formatSearchOutput` emits the " +
+			"`content` string plus a sources list; there is no HTML/CSS presentation channel. So the " +
+			"artifact reaches the model context as an inert string, and whether an end user ever sees the " +
+			"rendered suggestion depends on the host's presentation of that text — which this plugin " +
+			"cannot control or verify. **This is a host-contract blocker, not a compliance " +
+			"achievement:** rendering the HTML artifact to the end user requires an HTML-capable " +
+			"presentation channel in the DSH tool-output seam, which does not exist in the published " +
+			"packages this plugin is built against (verified in `@deepseek-ai/dsh-tool-web` 0.1.0-rc.8). " +
+			"The offline suite (`tool-wiring.test.ts`) and case 1 above assert the strongest boundary " +
+			"this plugin can establish — that the provider artifact itself, byte-for-byte, survives to " +
+			"the tool output. The grounding chunks are **evidence for the generated answer**, not a " +
+			"documented ranked SERP: this report and the plugin's documentation make no ranking claim " +
+			"about them, and the order is the response's chunk order."
+	);
+	lines.push("");
+	lines.push("## API path: legacy `generateContent` vs. the Interactions API");
+	lines.push("");
+	lines.push(
+		"Google's Gemini API documentation (updated 2026-08-20) now presents the **Interactions API** " +
+			"(`client.interactions.create`, REST `POST /v1beta/interactions`) as the canonical surface for " +
+			"grounded search: its `google_search_result.result[].search_suggestions` field is documented " +
+			"as \"an HTML snippet for rendering search suggestions in your UI. Full usage requirements " +
+			"are detailed in the Terms of Service.\" The legacy `generateContent` path — the one this " +
+			"plugin uses — carries the same artifact as `groundingMetadata.searchEntryPoint.renderedContent` " +
+			"(verified live in case 1). The legacy path is **intentionally supported** by this plugin, " +
+			"not an oversight: it is stable, documented, and returns the same grounding artifact, and it " +
+			"is the path the published `@deepseek-ai/dsh-*` packages (0.1.0-rc.8) were built against. " +
+			"Migrating the plugin to the Interactions API is a **follow-up** (tracked in the issue " +
+			"conversation), not part of this verification: the artifact-preservation and " +
+			"host-contract-blocker findings above hold for either path, because both carry the same " +
+			"HTML artifact and the DSH seam's presentation gap is independent of the API path."
 	);
 	lines.push("");
 	lines.push("## What is live evidence vs. offline coverage");

@@ -16,9 +16,10 @@
  *   2. normalization          — Gemini results normalize onto the
  *      provider-neutral seam types without leaking wire DTOs (`uri` etc.
  *      stay in the adapter); the grounded artifact (answer + inline
- *      citations + Search suggestions) is preserved end to end through
- *      `content`, and the grounding chunks are evidence in response order —
- *      not a claimed ranking;
+ *      citations + the provider-supplied Search Suggestion artifact
+ *      preserved verbatim) is carried end to end through `content`, and the
+ *      grounding chunks are evidence in response order — not a claimed
+ *      ranking;
  *   3. empty results          — a 200 response without `groundingMetadata`
  *      carries zero grounding sources (a valid zero-source result; the wire
  *      does not say whether a search ran and found nothing); a *present*
@@ -42,10 +43,7 @@ import { WebError, type WebSearchResult } from "@deepseek-ai/dsh-web";
 
 import { buildGoogleSearchProvider, GOOGLE_SEARCH_PROVIDER_ID } from "../src/index.js";
 import { GEMINI_API_KEY_ENV, resolveGoogleSearchConfig } from "../src/provider/config.js";
-import {
-	GEMINI_SEARCH_SUGGESTIONS_LABEL,
-	buildGoogleSearchSuggestionUrl
-} from "../src/provider/normalize.js";
+import { GEMINI_SEARCH_SUGGESTION_LABEL } from "../src/provider/normalize.js";
 import {
 	GEMINI_API_KEY_HEADER,
 	GEMINI_SEARCH_DEFAULT_MODEL,
@@ -74,6 +72,16 @@ const CONFIGURED_ENV: Record<string, string | undefined> = {
 	[GEMINI_API_KEY_ENV]: FAKE_API_KEY
 };
 
+/**
+ * A stand-in for the provider-supplied Search Suggestion artifact
+ * (`searchEntryPoint.renderedContent`): an HTML+CSS snippet, exactly as the
+ * wire carries it (the live artifact is a styled widget; this is a minimal
+ * stand-in with the same shape — HTML, not a URL).
+ */
+const FAKE_RENDERED_CONTENT =
+	'<style>\n.chip { display: inline-block; border-radius: 16px; }\n</style>\n' +
+	'<div class="container"><a class="chip" href="https://www.google.com/search?q=deepseek+harness&amp;client=app-vertex-grounding">deepseek harness</a></div>';
+
 const SUCCESS_BODY = JSON.stringify({
 	candidates: [
 		{
@@ -84,6 +92,7 @@ const SUCCESS_BODY = JSON.stringify({
 					{ web: { uri: "https://example.com/dsh", title: "github.com" } },
 					{ web: { uri: "https://example.com/second", title: "wikipedia.org" } }
 				],
+				searchEntryPoint: { renderedContent: FAKE_RENDERED_CONTENT },
 				webSearchQueries: ["deepseek harness"]
 			}
 		}
@@ -275,13 +284,13 @@ test("search() normalizes Gemini results onto the seam types without leaking wir
 	const result: WebSearchResult = await provider.search({ query: "deepseek harness" });
 
 	// Seam shape: sources array, truncated flag, the grounded answer as
-	// content (answer text + the Search suggestions section).
+	// content (answer text + the provider-supplied Search Suggestion
+	// artifact, preserved verbatim).
 	assert.equal(result.truncated, false, "the adapter never truncates; the seam owns that");
 	assert.equal(
 		result.content,
 		`DeepSeek Harness is an open-source agent execution framework.\n\n` +
-			`${GEMINI_SEARCH_SUGGESTIONS_LABEL}\n` +
-			`- [deepseek harness](${buildGoogleSearchSuggestionUrl("deepseek harness")})`
+			`${GEMINI_SEARCH_SUGGESTION_LABEL}\n${FAKE_RENDERED_CONTENT}`
 	);
 	assert.equal(result.sources.length, 2, "the response's chunk order is preserved (evidence order, not a claimed ranking)");
 

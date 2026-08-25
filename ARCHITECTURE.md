@@ -88,8 +88,9 @@ The Google backend target for the MVP is the **Gemini API
 [`google_search` grounding tool](https://ai.google.dev/gemini-api/docs/search-grounding)**:
 a `generateContent` call to a Gemini model with `tools: [{ google_search: {} }]`, which
 returns the model's synthesized answer plus `groundingMetadata` — the grounding chunks
-(`web.uri` + `web.title`), the citation relationship (`groundingSupports`), and the
-model's queries (`webSearchQueries`).
+(`web.uri` + `web.title`), the citation relationship (`groundingSupports`), the model's
+executed queries (`webSearchQueries`), and the provider-supplied Search Suggestion
+artifact (`searchEntryPoint.renderedContent`, an HTML+CSS snippet).
 
 **What the grounding API is — and is not.** Google documents the grounding tool as a
 *generated grounded response with associated Search Suggestions and citations*, not as a
@@ -100,22 +101,52 @@ Consequently, a response without `groundingMetadata` carries **zero grounding so
 it is not observable from the wire that a search executed and found zero results, and
 this repository's claims and evidence say so, and no more.
 
-**The Grounding contract (compliance mapping).** The DSH seam types
-(`WebSearchResult`/`WebSearchSource`) have no dedicated fields for the citation
-relationship or the Search Suggestions. Discarding them would leave the runtime without
-a compliant presentation path and would separate the answer from its citations, so the
-adapter preserves the grounded artifact **end to end through the fields the seam does
-have**: the answer with inline `[n]` citation markers (1-based into the `sources` array,
-which the DSH tool renders immediately after `content` as its "Sources:" list) plus a
-Search-suggestions section (one Google search link per `webSearchQueries` entry) cross
-the seam as `content`; the grounding chunks cross it as `sources`. Google's display
-terms for AI-generated grounded content require the associated Search Suggestions to be
-shown with the grounded results; this mapping satisfies that obligation at the
-tool-output boundary — every grounded result that reaches the model carries the
-suggestions inside `content`, so any presentation of the tool output keeps them attached
-to the answer. The `searchEntryPoint.renderedContent` HTML widget itself is not
-forwarded (a Google-branded UI artifact with no seam field); its required substance —
-the Search Suggestions — is preserved as plain markdown links.
+**The Grounding contract (artifact preservation + host-contract boundary).** The DSH
+seam types (`WebSearchResult`/`WebSearchSource`) have no dedicated fields for the
+citation relationship or the Search Suggestion artifact. Discarding them would leave
+the runtime without a presentation path and would separate the answer from its
+citations, so the adapter preserves the grounded artifact **end to end through the
+fields the seam does have**: the answer with inline `[n]` citation markers (1-based
+into the `sources` array, which the DSH tool renders immediately after `content` as
+its "Sources:" list) plus the provider-supplied Search Suggestion artifact —
+`searchEntryPoint.renderedContent`, carried **verbatim** (the exact HTML+CSS string the
+response carries; never trimmed, sanitized, or reconstructed from `webSearchQueries`,
+which is a separate field holding the executed queries) — cross the seam as `content`;
+the grounding chunks cross it as `sources`.
+
+**Host-contract boundary (what the plugin does and does not claim).** Google's terms
+for AI-generated grounded content require the associated Search Suggestions to be
+displayed with the grounded results. This plugin preserves the provider artifact
+verbatim and carries it to the tool output — the model-context boundary — but it does
+**not** claim that display obligation is satisfied. The DSH seam
+(`@deepseek-ai/dsh-tool-web`, verified in 0.1.0-rc.8) renders `web_search` output as
+plain text only: the tool's `render` projection returns text blocks, and
+`formatSearchOutput` emits the `content` string plus the sources list. There is no
+HTML/CSS presentation channel, so the artifact reaches the model context as an inert
+string and is **not rendered as a search widget to the end user**; whether an end user
+ever sees the rendered suggestion depends on the host's presentation of that text,
+which this plugin cannot control or verify. This is a **host-contract blocker**, not a
+compliance achievement: rendering the artifact to the end user requires an
+HTML-capable presentation channel in the DSH tool-output seam, which does not exist in
+the published packages this plugin is built against. The offline suite and the E2E
+evidence assert the strongest boundary this plugin can establish — that the provider
+artifact itself, byte-for-byte, survives to the tool output.
+
+**API path: legacy `generateContent` vs. the Interactions API.** Google's Gemini API
+documentation (updated 2026-08-20) now presents the **Interactions API**
+(`client.interactions.create`, REST `POST /v1beta/interactions`) as the canonical
+surface for grounded search: its `google_search_result.result[].search_suggestions`
+field is documented as "an HTML snippet for rendering search suggestions in your UI.
+Full usage requirements are detailed in the Terms of Service." The legacy
+`generateContent` path — the one this plugin uses — carries the same artifact as
+`groundingMetadata.searchEntryPoint.renderedContent` (verified live, see
+[E2E_VERIFICATION.md](E2E_VERIFICATION.md)). The legacy path is **intentionally
+supported**, not an oversight: it is stable, documented, and returns the same
+grounding artifact, and it is the path the published `@deepseek-ai/dsh-*` packages
+(0.1.0-rc.8) were built against. Migrating to the Interactions API is a **follow-up**
+tracked in the Issue #7 conversation; the artifact-preservation and host-contract
+findings above hold for either path, because both carry the same HTML artifact and the
+DSH seam's presentation gap is independent of the API path.
 
 **Why not the Custom Search JSON API.** The original target, Google Programmable Search —
 [Custom Search JSON API](https://developers.google.com/custom-search/v1), is being retired
@@ -206,7 +237,8 @@ The first release (MVP) delivers exactly:
      result-count control);
    - maps the grounding response to `WebSearchSource[]` (`url`, `title?`) and
      preserves the grounded artifact end to end through `content` (the answer
-     with inline citation markers plus the Search suggestions — see "Google
+     with inline citation markers plus the provider-supplied Search Suggestion
+      artifact, verbatim — see "Google
      backend target (MVP)", The Grounding contract), leaving absent fields
      `undefined` (the grounding response carries no per-source snippet or
      date, so `snippet?` and `publishedAt?` stay absent);

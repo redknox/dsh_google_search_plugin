@@ -15,13 +15,18 @@
  *  - the core mapping contains no parallel result type (it returns seam types);
  *  - required vs optional fields are explicit (`url` required; `title`
  *    optional; `snippet`/`publishedAt` never invented; `content` carries the
- *    grounded answer — inline citation markers plus the Search suggestions —
- *    and is absent when there is nothing to carry);
+ *    grounded answer — inline citation markers plus the provider-supplied
+ *    Search Suggestion artifact verbatim — and is absent when there is
+ *    nothing to carry);
  *  - the grounded artifact is preserved end to end: the answer, its citation
  *    markers (from `groundingSupports`, resolved against the `sources` list
- *    the DSH tool renders right after `content`), and the Search suggestions
- *    (one Google search link per `webSearchQueries` entry) all reach the
- *    seam result — none of them is discarded;
+ *    the DSH tool renders right after `content`), and the **provider-supplied
+ *    Search Suggestion artifact** (`searchEntryPoint.renderedContent`, carried
+ *    byte-for-byte) all reach the seam result — none of them is discarded;
+ *  - the Search Suggestion is **preserved, not fabricated**: `webSearchQueries`
+ *    (the executed queries) is a different field and is never turned into
+ *    display links; a response with queries but no `searchEntryPoint` carries
+ *    no suggestion section;
  *  - the grounding chunks are **evidence, not a claimed ranking**: the
  *    source order is the response's chunk order, and no test or comment
  *    asserts a SERP ranking;
@@ -35,17 +40,20 @@
  *  - citation markers are clamped to the seam's `maxResults` bound (a marker
  *    pointing at a source the seam will truncate would dangle);
  *  - a malformed response is a `WebError`, never a success-shaped result.
+ *
+ * The tests assert **preservation of the provider artifact**, not a
+ * compliance claim: the DSH seam carries `content` as an inert string into
+ * the model context but renders tool output as plain text only, so the
+ * supplied HTML+CSS Search Suggestion is carried but not rendered as a
+ * widget to the end user. That host-contract boundary is documented in
+ * ARCHITECTURE.md and the E2E report, not asserted here as satisfied.
  */
 
 import test from "node:test";
 import assert from "node:assert/strict";
 
 import { WebError, type WebSearchResult, type WebSearchSource } from "@deepseek-ai/dsh-web";
-import {
-	GEMINI_SEARCH_SUGGESTIONS_LABEL,
-	buildGoogleSearchSuggestionUrl,
-	normalizeGeminiSearchResponse
-} from "../src/provider/normalize.js";
+import { GEMINI_SEARCH_SUGGESTION_LABEL, normalizeGeminiSearchResponse } from "../src/provider/normalize.js";
 import { GOOGLE_SEARCH_ERROR_CODES } from "../src/provider/errors.js";
 
 // ---------------------------------------------------------------------------
@@ -80,9 +88,16 @@ function assertSeamSourceShape(source: WebSearchSource): void {
 
 /**
  * A realistic Gemini grounding success body (wire shape, example URLs).
- * Carries `webSearchQueries` (the model's queries → Search suggestions) and,
- * when `supports` is given, the `groundingSupports` citation relationship.
+ * Carries the provider-supplied Search Suggestion artifact
+ * (`searchEntryPoint.renderedContent`, a stand-in HTML+CSS snippet), the
+ * executed `webSearchQueries` (a *different* field — the model's queries, not
+ * the suggestion), and, when `supports` is given, the
+ * `groundingSupports` citation relationship.
  */
+export const EXAMPLE_RENDERED_CONTENT =
+	"<style>\n.container { display: flex; font-family: Google Sans, sans-serif; }\n.chip { display: inline-block; border-radius: 16px; }\n</style>\n" +
+	'<div class="container"><a class="chip" href="https://www.google.com/search?q=deepseek+harness&amp;client=app-vertex-grounding">deepseek harness</a></div>';
+
 function groundingBody(
 	answer: string,
 	chunks: unknown[],
@@ -90,7 +105,12 @@ function groundingBody(
 ): Record<string, unknown> {
 	const metadata: Record<string, unknown> = {
 		groundingChunks: chunks,
-		webSearchQueries: ["deepseek harness"]
+		// The provider-supplied Search Suggestion artifact (verbatim source).
+		searchEntryPoint: { renderedContent: EXAMPLE_RENDERED_CONTENT },
+		// The queries the model executed — a separate field, NOT the
+		// suggestion. Kept in the fixture to prove the adapter does not
+		// conflate the two.
+		webSearchQueries: ["deepseek harness AI tool", "what is deepseek harness"]
 	};
 	if (supports !== undefined) {
 		metadata["groundingSupports"] = supports;
@@ -123,10 +143,11 @@ function support(startIndex: number, endIndex: number, text: string, chunkIndice
 	};
 }
 
-/** The expected Search-suggestions section for the default fixture queries. */
-const DEFAULT_SUGGESTIONS_SECTION =
-	`${GEMINI_SEARCH_SUGGESTIONS_LABEL}\n` +
-	`- [deepseek harness](${buildGoogleSearchSuggestionUrl("deepseek harness")})`;
+/**
+ * The expected Search Suggestion section for the default fixture: the label
+ * (the adapter's own framing) followed by the provider artifact **verbatim**.
+ */
+const DEFAULT_SUGGESTION_SECTION = `${GEMINI_SEARCH_SUGGESTION_LABEL}\n${EXAMPLE_RENDERED_CONTENT}`;
 
 // ---------------------------------------------------------------------------
 // Field mapping (Gemini wire fields → seam fields)
@@ -146,15 +167,15 @@ test("normalize: maps groundingChunks web.uri/web.title onto url/title", () => {
 	]);
 });
 
-test("normalize: maps the candidate answer text onto content (with the Search suggestions appended)", () => {
+test("normalize: maps the candidate answer text onto content (with the provider Search Suggestion appended verbatim)", () => {
 	const result: WebSearchResult = normalizeGeminiSearchResponse(
 		groundingBody("  The answer text.  ", [chunk("https://example.com/a", "example.com")])
 	);
 	assertSeamResultShape(result);
 	assert.equal(
 		result.content,
-		`The answer text.\n\n${DEFAULT_SUGGESTIONS_SECTION}`,
-		"the answer is trimmed, carried as content, followed by the Search suggestions"
+		`The answer text.\n\n${DEFAULT_SUGGESTION_SECTION}`,
+		"the answer is trimmed, carried as content, followed by the provider artifact verbatim"
 	);
 	assert.equal(result.sources.length, 1);
 });
@@ -211,17 +232,20 @@ test("normalize: trims surrounding whitespace on mapped string fields", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Grounded artifact preservation: citations + Search suggestions end to end
+// Grounded artifact preservation: citations + provider Search Suggestion end to end
 // ---------------------------------------------------------------------------
 
-test("normalize: the Search suggestions section carries one Google search link per webSearchQueries entry", () => {
+test("normalize: the provider-supplied Search Suggestion artifact is preserved verbatim (byte-for-byte)", () => {
+	const artifact =
+		"<style>\n.chip { border-radius: 16px; }\n</style>\n" +
+		'<div class="container"><a class="chip" href="https://www.google.com/search?q=alpha+query&amp;client=app-vertex-grounding">alpha query</a></div>';
 	const result: WebSearchResult = normalizeGeminiSearchResponse({
 		candidates: [
 			{
 				content: { parts: [{ text: "Answer." }] },
 				groundingMetadata: {
 					groundingChunks: [chunk("https://example.com/a")],
-					webSearchQueries: ["alpha query", "beta gamma"]
+					searchEntryPoint: { renderedContent: artifact }
 				}
 			}
 		]
@@ -229,10 +253,74 @@ test("normalize: the Search suggestions section carries one Google search link p
 	assertSeamResultShape(result);
 	assert.equal(
 		result.content,
-		`Answer.\n\n${GEMINI_SEARCH_SUGGESTIONS_LABEL}\n` +
-			`- [alpha query](${buildGoogleSearchSuggestionUrl("alpha query")})\n` +
-			`- [beta gamma](${buildGoogleSearchSuggestionUrl("beta gamma")})`
+		`Answer.\n\n${GEMINI_SEARCH_SUGGESTION_LABEL}\n${artifact}`,
+		"the artifact is carried verbatim — no rewriting, sanitizing, or reconstruction"
 	);
+});
+
+test("normalize: webSearchQueries is NOT turned into display links (the suggestion is the provider artifact, not a fabrication)", () => {
+	// The executed queries are a different field from the Search Suggestion.
+	// Turning them into display links would fabricate a suggestion Google did
+	// not supply — the adapter must not do that.
+	const result: WebSearchResult = normalizeGeminiSearchResponse({
+		candidates: [
+			{
+				content: { parts: [{ text: "Answer." }] },
+				groundingMetadata: {
+					groundingChunks: [chunk("https://example.com/a")],
+					webSearchQueries: ["alpha query", "beta gamma"]
+					// no searchEntryPoint: the provider supplied no artifact
+				}
+			}
+		]
+	});
+	assertSeamResultShape(result);
+	assert.equal(
+		result.content,
+		"Answer.",
+		"queries alone produce no suggestion section and no fabricated links"
+	);
+	assert.ok(!result.content!.includes("google.com/search"), "no fabricated search link may appear");
+});
+
+test("normalize: the suggestion section is absent when the provider supplies no searchEntryPoint", () => {
+	const result: WebSearchResult = normalizeGeminiSearchResponse(
+		groundingBody("Answer.", [chunk("https://example.com/a")])
+	);
+	// The default fixture DOES carry a searchEntryPoint, so the section is
+	// present; strip it to prove absence when the provider omits it.
+	const body: Record<string, unknown> = {
+		candidates: [
+			{
+				content: { parts: [{ text: "Answer." }] },
+				groundingMetadata: {
+					groundingChunks: [chunk("https://example.com/a")],
+					webSearchQueries: ["deepseek harness"]
+				}
+			}
+		]
+	};
+	const stripped: WebSearchResult = normalizeGeminiSearchResponse(body);
+	assertSeamResultShape(stripped);
+	assert.equal(stripped.content, "Answer.", "no artifact, no section");
+	assertSeamResultShape(result);
+	assert.ok(result.content!.includes(GEMINI_SEARCH_SUGGESTION_LABEL), "with the artifact, the section is present");
+});
+
+test("normalize: a searchEntryPoint with a blank renderedContent is treated as absent (not malformed, not fabricated)", () => {
+	const result: WebSearchResult = normalizeGeminiSearchResponse({
+		candidates: [
+			{
+				content: { parts: [{ text: "Answer." }] },
+				groundingMetadata: {
+					groundingChunks: [chunk("https://example.com/a")],
+					searchEntryPoint: { renderedContent: "   " }
+				}
+			}
+		]
+	});
+	assertSeamResultShape(result);
+	assert.equal(result.content, "Answer.", "a blank artifact is carried as absent, never replaced");
 });
 
 test("normalize: inline citation markers are inserted after each cited answer segment", () => {
@@ -249,7 +337,7 @@ test("normalize: inline citation markers are inserted after each cited answer se
 	assertSeamResultShape(result);
 	assert.equal(
 		result.content,
-		`The harness is open source.[1] It runs agents.[2]\n\n${DEFAULT_SUGGESTIONS_SECTION}`,
+		`The harness is open source.[1] It runs agents.[2]\n\n${DEFAULT_SUGGESTION_SECTION}`,
 		"markers [n] are 1-based into the sources array the tool renders after content"
 	);
 });
@@ -342,43 +430,21 @@ test("normalize: overlapping segments that end at the same point merge their mar
 	assert.ok(result.content!.startsWith("Shared fact.[1, 2]"), `got: ${result.content}`);
 });
 
-test("normalize: content carries only the Search suggestions when the answer is absent but queries exist", () => {
+test("normalize: content carries only the provider artifact when the answer is absent but a suggestion exists", () => {
+	const artifact = '<div class="container"><a class="chip" href="https://www.google.com/search?q=lonely+query">lonely query</a></div>';
 	const result: WebSearchResult = normalizeGeminiSearchResponse({
 		candidates: [
 			{
 				content: { parts: [{ thoughtSignature: "opaque" }] },
 				groundingMetadata: {
 					groundingChunks: [chunk("https://example.com/a")],
-					webSearchQueries: ["lonely query"]
+					searchEntryPoint: { renderedContent: artifact }
 				}
 			}
 		]
 	});
 	assertSeamResultShape(result);
-	assert.equal(
-		result.content,
-		`${GEMINI_SEARCH_SUGGESTIONS_LABEL}\n- [lonely query](${buildGoogleSearchSuggestionUrl("lonely query")})`
-	);
-});
-
-test("normalize: no webSearchQueries means no suggestions section (answer only)", () => {
-	const result: WebSearchResult = normalizeGeminiSearchResponse({
-		candidates: [
-			{
-				content: { parts: [{ text: "Plain answer." }] },
-				groundingMetadata: { groundingChunks: [chunk("https://example.com/a")] }
-			}
-		]
-	});
-	assertSeamResultShape(result);
-	assert.equal(result.content, "Plain answer.");
-});
-
-test("normalize: buildGoogleSearchSuggestionUrl percent-encodes the query", () => {
-	assert.equal(
-		buildGoogleSearchSuggestionUrl(" 東京 寿司 "),
-		"https://www.google.com/search?q=%E6%9D%B1%E4%BA%AC%20%E5%AF%BF%E5%8F%B8"
-	);
+	assert.equal(result.content, `${GEMINI_SEARCH_SUGGESTION_LABEL}\n${artifact}`);
 });
 
 // ---------------------------------------------------------------------------
@@ -426,7 +492,7 @@ test("normalize: publishedAt is never synthesized (the grounding response suppli
 	}
 });
 
-test("normalize: content is absent when the candidate carries no answer text and no queries", () => {
+test("normalize: content is absent when the candidate carries no answer text and no provider artifact", () => {
 	const result: WebSearchResult = normalizeGeminiSearchResponse({
 		candidates: [
 			{
@@ -464,7 +530,7 @@ test("normalize: an empty groundingChunks array is a legitimate no-sources succe
 	const result: WebSearchResult = normalizeGeminiSearchResponse(groundingBody("No results found.", []));
 	assertSeamResultShape(result);
 	assert.deepEqual(result.sources, []);
-	assert.equal(result.content, `No results found.\n\n${DEFAULT_SUGGESTIONS_SECTION}`);
+	assert.equal(result.content, `No results found.\n\n${DEFAULT_SUGGESTION_SECTION}`);
 	assert.equal(result.truncated, false);
 });
 
