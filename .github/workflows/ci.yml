@@ -1,0 +1,30 @@
+# Continuous verification for the release inputs.
+#
+# `npm ci` from the committed lockfile is the P0 regression gate: it fails
+# when the lock and the manifest describe different dependency contracts
+# (the stale-lockfile finding from the Issue #8 review). `npm run check`
+# then re-asserts lock consistency and runs the full offline suite.
+#
+# The fresh-home install verification (scripts/verify-fresh-install.mjs)
+# needs the dsh CLI, pnpm, and a live Gemini key, so it stays a release-time
+# manual gate — run it before any real `npm publish`.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - name: Clean install from the committed lockfile
+        run: npm ci
+      - name: Lock consistency + typecheck + build + offline tests
+        run: npm run check

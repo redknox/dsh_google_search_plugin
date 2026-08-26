@@ -75,6 +75,9 @@ its runtime implementation (all issues complete; see the Status section below).
 | `LICENSE` | MIT license (Issue #8). |
 | `package-lock.json` | The npm lock (Issue #8): the committed install contract for `npm ci`. Its root entry must stay in sync with `package.json` — `npm run check-lock` enforces this in every `npm run check` and `prepublishOnly` run, so a dependency-role change cannot silently leave the lock stale. |
 | `scripts/check-lock-consistency.mjs` | Release verification (Issue #8): asserts the committed `package-lock.json` root matches `package.json` (name, version, license, `dependencies`, `peerDependencies`, `devDependencies`); fails the build with a regenerate hint when they diverge. |
+| `scripts/verify-fresh-install.mjs` | Fresh-home install verification (Issue #8 evidence, ENGINEERING.md §5): boots a throwaway DSH_HOME, installs the packed tarball through the real `dsh plugin` path, and asserts install, zero-config activation, installed-copy resolution, live search (with a key), the profile-layer escape hatch, and removal. Manual release-time gate (needs the dsh CLI, pnpm, and a live key). |
+| `.github/workflows/ci.yml` | Continuous verification: clean `npm ci` from the committed lockfile plus `npm run check` on every push to `main` and pull request. |
+| `CHANGELOG.md` | Notable changes per release. |
 | `package.json` / `tsconfig*.json` | ESM package + TypeScript build/test configuration (Node >= 24). `package.json` carries the DSH bundle metadata (`dsh.bundle.patch`), the publish metadata (name `dsh-google-search-plugin`, version, `publishConfig.access: public`), and the dependency split that keeps a single Harness/Cordis runtime identity: every `@deepseek-ai/cordis` / `@deepseek-ai/dsh-*` framework package is a **peer** dependency (one shared copy, provided by the host profile's `@deepseek-ai/dsh-base`), while `@deepseek-ai/schemastery` is a plain dependency. |
 
 ## Development
@@ -234,10 +237,18 @@ which asserts the committed `package-lock.json` root still matches
 `package.json` (name, version, license, `dependencies`, `peerDependencies`,
 `devDependencies`). A stale lock makes `npm ci` install a different dependency
 contract than the manifest describes, so the check fails the build until the
-lock is regenerated with `npm install --package-lock-only`. The release
-verification path is therefore: regenerate the lock when the manifest's
-dependency contract changes, verify a clean `npm ci` from it, then re-run
-`npm pack --dry-run` and `npm publish --dry-run` from that clean install.
+lock is regenerated with `npm install --package-lock-only`.
+
+CI (`.github/workflows/ci.yml`) runs a clean `npm ci` from the committed
+lockfile plus `npm run check` on every push to `main` and pull request — the
+stale-lockfile regression is caught automatically, before review.
+
+The full release verification path is therefore: regenerate the lock when the
+manifest's dependency contract changes, let CI verify the clean install, run
+[scripts/verify-fresh-install.mjs](scripts/verify-fresh-install.mjs) for the
+fresh-home install/activation/removal evidence (needs the dsh CLI, pnpm, and a
+live `GEMINI_API_KEY`), then re-run `npm pack --dry-run` and
+`npm publish --dry-run` from the clean install.
 
 ## Status
 
