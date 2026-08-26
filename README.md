@@ -73,6 +73,8 @@ in later issues, its runtime implementation.
 | `test/` | Offline tests: plugin registration/discovery/teardown, conformance of the normalization and error mapping to the DSH seam types, the full adapter (request serialization, normalization, empty results, and every failure path), end-to-end tool wiring (Issue #5): the real `web_search` tool (`@deepseek-ai/dsh-tool-web`), registry, seam, and cooperative-timeout policy composed with the real Google provider, driven through `ctx.tools.execute`, and configuration/credential handling (Issue #6): schema defaults and validation, the `redactSecrets` read-surface isolation contract, per-operation credential resolution order, `available()` path semantics, and the settings section against a real `FileSettingsProvider` — including a regression test that a raw `apiKey` submitted through the ordinary settings update path is rejected by the `validate` hook and never written to disk — all against injected mock transports, mock credential/launch-environment services, and fixture values. No network, no live credentials. |
 | `cordis.patch.yml` | The bundle patch layer (Issue #8): the `insert` that mounts this package as a DSH profile bundle — it registers the Google search provider on the `ctx.web` seam and sets `searchProvider: google` on the `web` row, so the bundle is active on install (the profile layer can still override it). Declared by `dsh.bundle.patch` in `package.json`; DSH tooling reads it to reconcile the package into a profile's layer stack. |
 | `LICENSE` | MIT license (Issue #8). |
+| `package-lock.json` | The npm lock (Issue #8): the committed install contract for `npm ci`. Its root entry must stay in sync with `package.json` — `npm run check-lock` enforces this in every `npm run check` and `prepublishOnly` run, so a dependency-role change cannot silently leave the lock stale. |
+| `scripts/check-lock-consistency.mjs` | Release verification (Issue #8): asserts the committed `package-lock.json` root matches `package.json` (name, version, license, `dependencies`, `peerDependencies`, `devDependencies`); fails the build with a regenerate hint when they diverge. |
 | `package.json` / `tsconfig*.json` | ESM package + TypeScript build/test configuration (Node >= 24). `package.json` carries the DSH bundle metadata (`dsh.bundle.patch`), the publish metadata (name `dsh-google-search-plugin`, version, `publishConfig.access: public`), and the dependency split that keeps a single Harness/Cordis runtime identity: every `@deepseek-ai/cordis` / `@deepseek-ai/dsh-*` framework package is a **peer** dependency (one shared copy, provided by the host profile's `@deepseek-ai/dsh-base`), while `@deepseek-ai/schemastery` is a plain dependency. |
 
 ## Development
@@ -224,6 +226,17 @@ npm publish --dry-run    # verifies the artifact; publishes nothing
 
 `prepublishOnly` re-runs `npm run check` (typecheck + build + offline tests)
 before any real publication.
+
+`npm run check` starts with `npm run check-lock`
+([scripts/check-lock-consistency.mjs](scripts/check-lock-consistency.mjs)),
+which asserts the committed `package-lock.json` root still matches
+`package.json` (name, version, license, `dependencies`, `peerDependencies`,
+`devDependencies`). A stale lock makes `npm ci` install a different dependency
+contract than the manifest describes, so the check fails the build until the
+lock is regenerated with `npm install --package-lock-only`. The release
+verification path is therefore: regenerate the lock when the manifest's
+dependency contract changes, verify a clean `npm ci` from it, then re-run
+`npm pack --dry-run` and `npm publish --dry-run` from that clean install.
 
 ## Status
 

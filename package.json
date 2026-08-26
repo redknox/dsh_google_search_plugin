@@ -1,7 +1,7 @@
 {
   "name": "dsh-google-search-plugin",
   "version": "0.1.0",
-  "description": "DeepSeek Harness profile bundle that registers a Google search provider (Gemini google_search grounding) on the ctx.web seam for the web_search tool",
+  "description": "DeepSeek Harness profile bundle that registers a Google search provider (Gemini google_search grounding) on the ctx.web seam for the web_search tool and activates it as the default search route on install",
   "type": "module",
   "license": "MIT",
   "repository": {
@@ -41,7 +41,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "pretest": "tsc -p tsconfig.json",
     "test": "node --test \"lib-test/test/*.test.js\"",
-    "check": "npm run typecheck && npm run build && npm run test",
+    "check-lock": "node scripts/check-lock-consistency.mjs",
+    "check": "npm run check-lock && npm run typecheck && npm run build && npm run test",
     "prepublishOnly": "npm run check",
     "e2e": "tsc -p tsconfig.e2e.json && node lib-e2e/e2e/run-e2e.js"
   },
