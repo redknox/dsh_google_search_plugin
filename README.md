@@ -4,8 +4,8 @@ A **DeepSeek Harness (DSH) plugin** that gives the agent a working web-search to
 registering **Google** as the first planned search backend behind DSH's web capability
 seam (`ctx.web`).
 
-This repository is the home of the plugin's engineering and architecture contracts, and,
-in later issues, its runtime implementation.
+This repository is the home of the plugin's engineering and architecture contracts and
+its runtime implementation (all issues complete; see the Status section below).
 
 ## What this plugin is
 
@@ -83,12 +83,13 @@ Node.js **>= 24** is required.
 
 ```sh
 npm install          # install dependencies (no network needed at test time)
-npm run check        # typecheck + build + run the full test suite
+npm run check        # lock consistency + typecheck + build + run the full test suite
 ```
 
 Individual steps:
 
 ```sh
+npm run check-lock   # assert package-lock.json matches package.json (release gate)
 npm run typecheck    # tsc --noEmit over src + test
 npm run build        # compile src/ -> lib/ (package output)
 npm test             # compile src + test, then run node --test on the compiled JS
@@ -288,9 +289,12 @@ dependency contract changes, verify a clean `npm ci` from it, then re-run
   Gemini API through the real Harness `web_search` tool path is recorded in
   [E2E_VERIFICATION.md](E2E_VERIFICATION.md); the offline suite remains the
   no-network, no-credential path.
-- **Issue #8** (in progress): package and release the plugin as a DSH-native
+- **Issue #8** (approved): package and release the plugin as a DSH-native
   installable bundle — the `dsh.bundle` metadata + `cordis.patch.yml` patch
-  layer, the publish metadata (name/version/license), the prebuilt-artifact
-  contents, fresh-profile install/reconcile/boot/registration/remove/reinstall
+  layer (provider registration **and** `searchProvider: google` activation on
+  install, with the profile layer as the override/escape hatch), the publish
+  metadata (name/version/license), the prebuilt-artifact contents, the committed
+  `package-lock.json` with its consistency gate (`npm run check-lock`),
+  fresh-profile install/reconcile/boot/registration/remove/reinstall
   verification, and the `npm publish --dry-run` gate. Actual registry
   publication remains a separate, explicitly authorized action.
