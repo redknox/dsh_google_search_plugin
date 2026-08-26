@@ -1,10 +1,23 @@
 {
   "name": "dsh-google-search-plugin",
   "version": "0.1.0",
-  "private": true,
-  "description": "DeepSeek Harness plugin that registers a Google search provider on the ctx.web seam; Google is the initial planned search backend (MVP).",
+  "description": "DeepSeek Harness profile bundle that registers a Google search provider (Gemini google_search grounding) on the ctx.web seam for the web_search tool",
   "type": "module",
-  "license": "UNLICENSED",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/redknox/dsh_google_search_plugin.git"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "plugin",
+    "bundle",
+    "web-search",
+    "google",
+    "gemini",
+    "grounding"
+  ],
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
   "exports": {
@@ -12,13 +25,16 @@
       "types": "./lib/index.d.ts",
       "default": "./lib/index.js"
     },
+    "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
   },
   "files": [
-    "lib",
+    "lib/index.js",
+    "lib/index.d.ts",
+    "lib/provider",
+    "cordis.patch.yml",
     "README.md",
-    "ENGINEERING.md",
-    "ARCHITECTURE.md"
+    "LICENSE"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
@@ -26,18 +42,29 @@
     "pretest": "tsc -p tsconfig.json",
     "test": "node --test \"lib-test/test/*.test.js\"",
     "check": "npm run typecheck && npm run build && npm run test",
+    "prepublishOnly": "npm run check",
     "e2e": "tsc -p tsconfig.e2e.json && node lib-e2e/e2e/run-e2e.js"
   },
   "engines": {
     "node": ">=24"
   },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.1"
+  },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
     "@deepseek-ai/dsh-credentials": "^0.1.0-rc.8",
     "@deepseek-ai/dsh-launch-environment": "^0.1.0-rc.8",
-    "@deepseek-ai/dsh-llm": "^0.1.0-rc.8",
     "@deepseek-ai/dsh-settings": "^0.1.0-rc.8",
-    "@deepseek-ai/schemastery": "^3.18.1",
+    "@deepseek-ai/dsh-timeout": "^0.1.0-rc.8",
     "@deepseek-ai/dsh-web": "^0.1.0-rc.8"
   },
   "devDependencies": {

@@ -1,0 +1,20 @@
+# The google-search bundle patch: a single insert that mounts the Google
+# search provider plugin as a profile patch layer.
+#
+# This row registers the provider on the `ctx.web` seam (it `inject`s the
+# `web` service, so it only loads while `@deepseek-ai/dsh-web` is mounted by
+# the base bundle). It does NOT decide which provider is *active* for the
+# `web_search` tool: that is the profile layer's choice, made by setting
+# `searchProvider: google` on the `web` row (see the install docs). A profile
+# that installs this bundle but leaves `searchProvider` unset keeps its
+# existing default; one that sets it to `google` routes `web_search` through
+# the Gemini grounding backend this plugin supplies.
+#
+# No credential is inlined here (ENGINEERING.md §4). The provider resolves its
+# API key per request from the `GEMINI_API_KEY` environment variable (or a
+# `google-search:` settings section's `apiKeyEnv` reference); when no path
+# yields a value, `search()` fails with a structured MISSING_CREDENTIAL error
+# naming the variable, never its value.
+- insert:
+    - id: google-search
+      name: 'dsh-google-search-plugin'

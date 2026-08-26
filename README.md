@@ -71,7 +71,9 @@ in later issues, its runtime implementation.
 | `src/provider/normalize.ts` | Google-response → DSH seam mapping (Issues #3, #4, #7): translates a parsed Gemini grounding response into the `@deepseek-ai/dsh-web` `WebSearchResult`/`WebSearchSource` types. The only place that knows the Gemini wire field names; the grounded artifact is preserved end to end — the answer (with inline `[n]` citation markers from `groundingSupports`) plus the provider-supplied Search Suggestion artifact (`searchEntryPoint.renderedContent`, preserved **verbatim**, never reconstructed from `webSearchQueries`) map to `content`, and the grounding chunks (evidence in response order, not a claimed ranking) map to `sources` (deduped by URL). Optional fields stay absent, an *absent* `groundingMetadata` field carries zero grounding sources (a valid zero-source result — the wire does not say whether a search ran and found nothing), and `truncated` is left to the seam. |
 | `src/provider/errors.ts` | Google-failure → `WebError` mapping (Issue #3): classifies a Google search failure into a DSH `WebError` with a machine-routable string code, reusing the DSH shared taxonomy where it exists. No closed local error taxonomy. |
 | `test/` | Offline tests: plugin registration/discovery/teardown, conformance of the normalization and error mapping to the DSH seam types, the full adapter (request serialization, normalization, empty results, and every failure path), end-to-end tool wiring (Issue #5): the real `web_search` tool (`@deepseek-ai/dsh-tool-web`), registry, seam, and cooperative-timeout policy composed with the real Google provider, driven through `ctx.tools.execute`, and configuration/credential handling (Issue #6): schema defaults and validation, the `redactSecrets` read-surface isolation contract, per-operation credential resolution order, `available()` path semantics, and the settings section against a real `FileSettingsProvider` — including a regression test that a raw `apiKey` submitted through the ordinary settings update path is rejected by the `validate` hook and never written to disk — all against injected mock transports, mock credential/launch-environment services, and fixture values. No network, no live credentials. |
-| `package.json` / `tsconfig*.json` | ESM package + TypeScript build/test configuration (Node >= 24). |
+| `cordis.patch.yml` | The bundle patch layer (Issue #8): the single `insert` row that mounts this package as a DSH profile bundle — it registers the Google search provider on the `ctx.web` seam. Declared by `dsh.bundle.patch` in `package.json`; DSH tooling reads it to reconcile the package into a profile's layer stack. |
+| `LICENSE` | MIT license (Issue #8). |
+| `package.json` / `tsconfig*.json` | ESM package + TypeScript build/test configuration (Node >= 24). `package.json` carries the DSH bundle metadata (`dsh.bundle.patch`), the publish metadata (name `dsh-google-search-plugin`, version, `publishConfig.access: public`), and the dependency split that keeps a single Harness/Cordis runtime identity: every `@deepseek-ai/cordis` / `@deepseek-ai/dsh-*` framework package is a **peer** dependency (one shared copy, provided by the host profile's `@deepseek-ai/dsh-base`), while `@deepseek-ai/schemastery` is a plain dependency. |
 
 ## Development
 
@@ -148,6 +150,73 @@ unavailable), and a direct `search()` call fails with a structured
 `MISSING_CREDENTIAL` error naming the setting and the environment variable to
 fix — never a value.
 
+## Installation (DSH profile bundle)
+
+This package is a **DSH-native profile bundle** (Issue #8): a plain npm package
+that declares `dsh.bundle.patch` in its `package.json` and ships a
+[cordis.patch.yml](cordis.patch.yml) patch layer. DSH tooling
+(`dsh plugin …`, the profile boot path) recognizes the declaration, installs
+the package into the profile's own `node_modules`, and reconciles it into the
+profile's `dsh.profile.bundles` layer list — no local checkout, symlink, or
+absolute source path is involved.
+
+**Install into a profile** (e.g. the `web` profile):
+
+```sh
+dsh plugin --profile web add dsh-google-search-plugin
+```
+
+`dsh plugin` forwards to `pnpm` in the profile directory, then reconciles:
+because the installed package declares `dsh.bundle`, it is appended to the
+profile's `dsh.profile.bundles` list and its `cordis.patch.yml` becomes a patch
+layer applied after the base bundle and before the profile's own
+`cordis.patch.yml`.
+
+**Activate the provider.** Installing the bundle registers the provider on the
+`ctx.web` seam, but the bundle does **not** change which provider the
+`web_search` tool uses — that is the profile layer's choice. Add (or edit) this
+row in the profile's `cordis.patch.yml` to route `web_search` through Google:
+
+```yaml
+- id: web
+  config:
+    searchProvider: google
+```
+
+(Without it, the profile keeps its existing `searchProvider` default and the
+Google provider sits registered but inactive.)
+
+**Supply the credential.** Set the environment variable named by the
+`google-search` settings section's `apiKeyEnv` (default `GEMINI_API_KEY`) for
+the process that boots the profile — or a Harness credential reference of the
+same name. Never put the key in the patch file or the settings file
+(ENGINEERING.md §4).
+
+**Remove / reinstall:**
+
+```sh
+dsh plugin --profile web remove dsh-google-search-plugin   # pnpm removes it; reconciliation drops the bundle row
+dsh plugin --profile web add dsh-google-search-plugin      # re-adds it and re-activates the bundle row
+```
+
+**Package contents.** The published artifact contains only what a fresh profile
+install needs: the compiled runtime (`lib/`), its type declarations, this
+README, the MIT `LICENSE`, the bundle patch file, and the manifest. No source
+tree, no tests, no build caches, no local paths, no credentials.
+
+## Publishing
+
+Publication to the npm registry is a separate, explicitly authorized action
+(not part of any issue round). The metadata is in place and the dry-run gate
+is wired:
+
+```sh
+npm publish --dry-run    # verifies the artifact; publishes nothing
+```
+
+`prepublishOnly` re-runs `npm run check` (typecheck + build + offline tests)
+before any real publication.
+
 ## Status
 
 - **Issue #1** (closed): project-level contracts — this file, `ENGINEERING.md`, and
@@ -191,10 +260,16 @@ fix — never a value.
   migration re-targeted the settings surface to the Gemini backend: `apiKeyEnv`
   now defaults to `GEMINI_API_KEY`, and the Custom-Search-only settings were
   removed — see the settings table above.)
-- **Issue #7** (in progress): verify real Google Search API behavior
+- **Issue #7** (closed): verify real Google Search API behavior
   end-to-end — and, in the process, migrate the backend from the Custom Search
   JSON API (being retired by Google, closed to new customers) to the Gemini
   API `google_search` grounding tool. Live verification against the real
   Gemini API through the real Harness `web_search` tool path is recorded in
   [E2E_VERIFICATION.md](E2E_VERIFICATION.md); the offline suite remains the
   no-network, no-credential path.
+- **Issue #8** (in progress): package and release the plugin as a DSH-native
+  installable bundle — the `dsh.bundle` metadata + `cordis.patch.yml` patch
+  layer, the publish metadata (name/version/license), the prebuilt-artifact
+  contents, fresh-profile install/reconcile/boot/registration/remove/reinstall
+  verification, and the `npm publish --dry-run` gate. Actual registry
+  publication remains a separate, explicitly authorized action.
