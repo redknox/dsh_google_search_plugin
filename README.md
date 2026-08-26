@@ -71,7 +71,7 @@ in later issues, its runtime implementation.
 | `src/provider/normalize.ts` | Google-response → DSH seam mapping (Issues #3, #4, #7): translates a parsed Gemini grounding response into the `@deepseek-ai/dsh-web` `WebSearchResult`/`WebSearchSource` types. The only place that knows the Gemini wire field names; the grounded artifact is preserved end to end — the answer (with inline `[n]` citation markers from `groundingSupports`) plus the provider-supplied Search Suggestion artifact (`searchEntryPoint.renderedContent`, preserved **verbatim**, never reconstructed from `webSearchQueries`) map to `content`, and the grounding chunks (evidence in response order, not a claimed ranking) map to `sources` (deduped by URL). Optional fields stay absent, an *absent* `groundingMetadata` field carries zero grounding sources (a valid zero-source result — the wire does not say whether a search ran and found nothing), and `truncated` is left to the seam. |
 | `src/provider/errors.ts` | Google-failure → `WebError` mapping (Issue #3): classifies a Google search failure into a DSH `WebError` with a machine-routable string code, reusing the DSH shared taxonomy where it exists. No closed local error taxonomy. |
 | `test/` | Offline tests: plugin registration/discovery/teardown, conformance of the normalization and error mapping to the DSH seam types, the full adapter (request serialization, normalization, empty results, and every failure path), end-to-end tool wiring (Issue #5): the real `web_search` tool (`@deepseek-ai/dsh-tool-web`), registry, seam, and cooperative-timeout policy composed with the real Google provider, driven through `ctx.tools.execute`, and configuration/credential handling (Issue #6): schema defaults and validation, the `redactSecrets` read-surface isolation contract, per-operation credential resolution order, `available()` path semantics, and the settings section against a real `FileSettingsProvider` — including a regression test that a raw `apiKey` submitted through the ordinary settings update path is rejected by the `validate` hook and never written to disk — all against injected mock transports, mock credential/launch-environment services, and fixture values. No network, no live credentials. |
-| `cordis.patch.yml` | The bundle patch layer (Issue #8): the single `insert` row that mounts this package as a DSH profile bundle — it registers the Google search provider on the `ctx.web` seam. Declared by `dsh.bundle.patch` in `package.json`; DSH tooling reads it to reconcile the package into a profile's layer stack. |
+| `cordis.patch.yml` | The bundle patch layer (Issue #8): the `insert` that mounts this package as a DSH profile bundle — it registers the Google search provider on the `ctx.web` seam and sets `searchProvider: google` on the `web` row, so the bundle is active on install (the profile layer can still override it). Declared by `dsh.bundle.patch` in `package.json`; DSH tooling reads it to reconcile the package into a profile's layer stack. |
 | `LICENSE` | MIT license (Issue #8). |
 | `package.json` / `tsconfig*.json` | ESM package + TypeScript build/test configuration (Node >= 24). `package.json` carries the DSH bundle metadata (`dsh.bundle.patch`), the publish metadata (name `dsh-google-search-plugin`, version, `publishConfig.access: public`), and the dependency split that keeps a single Harness/Cordis runtime identity: every `@deepseek-ai/cordis` / `@deepseek-ai/dsh-*` framework package is a **peer** dependency (one shared copy, provided by the host profile's `@deepseek-ai/dsh-base`), while `@deepseek-ai/schemastery` is a plain dependency. |
 
@@ -172,19 +172,27 @@ profile's `dsh.profile.bundles` list and its `cordis.patch.yml` becomes a patch
 layer applied after the base bundle and before the profile's own
 `cordis.patch.yml`.
 
-**Activate the provider.** Installing the bundle registers the provider on the
-`ctx.web` seam, but the bundle does **not** change which provider the
-`web_search` tool uses — that is the profile layer's choice. Add (or edit) this
-row in the profile's `cordis.patch.yml` to route `web_search` through Google:
+**Active on install.** The bundle's patch layer both registers the provider on
+the `ctx.web` seam and sets `searchProvider: google` on the `web` service row.
+Bundle layers apply in `dsh.profile.bundles` order — this bundle is listed
+after `@deepseek-ai/dsh-base` — so the row overrides the base bundle's
+`deepseek-official` default: installing the plugin routes `web_search` through
+Google with **no further configuration**.
+
+**Switching the default route back.** A profile that wants to keep (or restore)
+the DeepSeek search route adds its own `web` row to the profile's
+`cordis.patch.yml`; the profile layer always applies after every bundle layer
+and wins:
 
 ```yaml
 - id: web
   config:
-    searchProvider: google
+    searchProvider: deepseek-official
 ```
 
-(Without it, the profile keeps its existing `searchProvider` default and the
-Google provider sits registered but inactive.)
+(If the profile has no `GEMINI_API_KEY`, the activated Google route fails with
+a structured `MISSING_CREDENTIAL` error naming the variable — clear and
+actionable, never a silent route change.)
 
 **Supply the credential.** Set the environment variable named by the
 `google-search` settings section's `apiKeyEnv` (default `GEMINI_API_KEY`) for

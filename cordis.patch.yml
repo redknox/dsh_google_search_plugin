@@ -1,20 +1,32 @@
-# The google-search bundle patch: a single insert that mounts the Google
-# search provider plugin as a profile patch layer.
+# The google-search bundle patch: mounts the Google search provider plugin
+# and activates it as the default `web_search` route.
 #
-# This row registers the provider on the `ctx.web` seam (it `inject`s the
-# `web` service, so it only loads while `@deepseek-ai/dsh-web` is mounted by
-# the base bundle). It does NOT decide which provider is *active* for the
-# `web_search` tool: that is the profile layer's choice, made by setting
-# `searchProvider: google` on the `web` row (see the install docs). A profile
-# that installs this bundle but leaves `searchProvider` unset keeps its
-# existing default; one that sets it to `google` routes `web_search` through
-# the Gemini grounding backend this plugin supplies.
+# Layer 1 — `insert` of `google-search`: registers the provider on the
+# `ctx.web` seam (the plugin `inject`s the `web` service, so it only loads
+# while `@deepseek-ai/dsh-web` is mounted by the base bundle).
+#
+# Layer 2 — a plain override of the existing `web` entry (NOT an insert:
+# the Loader tree forbids duplicate entry ids, and a plain
+# `{ id, name, config }` patch overwrites the entry's config in place).
+# It sets `searchProvider: google`. Bundle patch layers apply in
+# `dsh.profile.bundles` order and this bundle is listed after
+# `@deepseek-ai/dsh-base`, so the override wins over the base bundle's
+# `searchProvider: deepseek-official` default: installing the plugin
+# activates Google search with no further configuration. A profile that
+# wants to keep (or restore) the DeepSeek route writes its own `web`
+# override row in its `cordis.patch.yml` — the profile layer applies after
+# every bundle layer and wins.
 #
 # No credential is inlined here (ENGINEERING.md §4). The provider resolves its
 # API key per request from the `GEMINI_API_KEY` environment variable (or a
 # `google-search:` settings section's `apiKeyEnv` reference); when no path
 # yields a value, `search()` fails with a structured MISSING_CREDENTIAL error
-# naming the variable, never its value.
+# naming the variable, never its value. A profile without the key therefore
+# gets a clear, actionable search error rather than a silent route change.
 - insert:
     - id: google-search
       name: 'dsh-google-search-plugin'
+- id: web
+  name: '@deepseek-ai/dsh-web'
+  config:
+    searchProvider: google
