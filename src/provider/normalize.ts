@@ -193,7 +193,11 @@ export function normalizeGeminiSearchResponse(
  * `webSearchQueries` (the executed queries are a different field, and turning
  * them into display links would fabricate a suggestion Google did not supply)
  * and **not** sanitized, stripped, or otherwise modified (Google's terms say
- * the supplied Search Suggestion is not to be modified). The seam carries it
+ * the supplied Search Suggestion is not to be modified). This is enforced,
+ * not just documented: only the plugin-owned answer text is trimmed, and the
+ * artifact is appended last without any whole-output trim, so the returned
+ * `content` **ends with the exact artifact bytes** (a regression test asserts
+ * this for an artifact with leading/trailing whitespace). The seam carries it
  * as an inert string into the model context; rendering it as a search widget
  * to the end user is a host-contract blocker, documented elsewhere — not
  * something this adapter decides.
@@ -224,14 +228,18 @@ function buildGroundedContent(
 			: text;
 
 	const parts: string[] = [];
-	if (marked.length > 0) {
-		parts.push(marked);
+	if (marked.trim().length > 0) {
+		// Only the plugin-owned answer text is normalized (trimmed). The
+		// provider artifact below is never touched: no whole-output trim, so
+		// its leading/trailing bytes — including a trailing newline — survive
+		// and it is the exact suffix of the returned content.
+		parts.push(marked.trim());
 	}
 	if (suggestion !== undefined) {
 		// The provider artifact, verbatim, introduced by our own label.
 		parts.push(`${GEMINI_SEARCH_SUGGESTION_LABEL}\n${suggestion}`);
 	}
-	const joined = parts.join("\n\n").trim();
+	const joined = parts.join("\n\n");
 	return joined.length > 0 ? joined : undefined;
 }
 

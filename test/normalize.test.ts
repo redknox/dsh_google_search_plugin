@@ -258,6 +258,55 @@ test("normalize: the provider-supplied Search Suggestion artifact is preserved v
 	);
 });
 
+test("normalize: an artifact with leading/trailing whitespace survives byte-for-byte (no boundary trim)", () => {
+	// Regression: the content assembly must not trim the provider artifact's
+	// boundary bytes. An artifact that begins and ends with whitespace
+	// (including a trailing newline) must be the exact suffix of the
+	// returned content — `includes` alone would not catch a trim.
+	const artifact =
+		"\n  <style>\n.chip { border-radius: 16px; }\n</style>\n" +
+		'<div class="container"><a class="chip" href="https://www.google.com/search?q=alpha+query&amp;client=app-vertex-grounding">alpha query</a></div>\n\n';
+	const result: WebSearchResult = normalizeGeminiSearchResponse({
+		candidates: [
+			{
+				content: { parts: [{ text: "Answer." }] },
+				groundingMetadata: {
+					groundingChunks: [chunk("https://example.com/a")],
+					searchEntryPoint: { renderedContent: artifact }
+				}
+			}
+		]
+	});
+	assertSeamResultShape(result);
+	assert.ok(
+		result.content !== undefined && result.content.endsWith(artifact),
+		"the content ENDS WITH the exact artifact bytes (leading/trailing whitespace untouched)"
+	);
+	assert.equal(
+		result.content,
+		`Answer.\n\n${GEMINI_SEARCH_SUGGESTION_LABEL}\n${artifact}`,
+		"exact content: trimmed answer + label + artifact, artifact bytes unchanged"
+	);
+	// The answer's own boundary whitespace is still normalized (plugin-owned
+	// text only).
+	const padded = normalizeGeminiSearchResponse({
+		candidates: [
+			{
+				content: { parts: [{ text: "  Answer.  " }] },
+				groundingMetadata: {
+					groundingChunks: [chunk("https://example.com/a")],
+					searchEntryPoint: { renderedContent: artifact }
+				}
+			}
+		]
+	});
+	assert.equal(
+		padded.content,
+		`Answer.\n\n${GEMINI_SEARCH_SUGGESTION_LABEL}\n${artifact}`,
+		"the answer is trimmed; the artifact is not"
+	);
+});
+
 test("normalize: webSearchQueries is NOT turned into display links (the suggestion is the provider artifact, not a fabrication)", () => {
 	// The executed queries are a different field from the Search Suggestion.
 	// Turning them into display links would fabricate a suggestion Google did

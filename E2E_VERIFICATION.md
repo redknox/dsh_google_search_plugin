@@ -25,7 +25,7 @@ Live end-to-end evidence for **Issue #7** (verify real Google Search API behavio
 | @deepseek-ai/dsh-llm | 0.1.0-rc.8 |
 | @deepseek-ai/dsh-system-prompt | 0.1.0-rc.8 |
 | @deepseek-ai/schemastery | 3.18.1 |
-| Verification date | 2026-08-25T03:46:41.092Z |
+| Verification date | 2026-08-26T05:19:39.341Z |
 
 **Credential handling (re-review, acceptance 2).** Three API keys were exposed in this issue's conversation logs during earlier verification runs; all three have been invalidated in Google AI Studio. This final run used a **newly created** key that was supplied out of band — written to the gitignored `.env.e2e.local` file (or the terminal environment) and read at runtime via the environment-backed reference (`GEMINI_API_KEY`) — and was never pasted into chat, an issue, a commit message, or this report. The claim below is bounded to the surfaces this script verified: the key value does not appear in this report (the script aborts before writing if it does), it is not present in any tracked file (`.env.e2e.local` is gitignored and the value is never committed), and the request header values in this report are redacted (header *names* are recorded, values are not). No broader logging claim is made about surfaces outside those checks.
 
@@ -49,38 +49,39 @@ returned 5 normalized live source(s) and a synthesized answer; the grounded arti
 - request: POST [url redacted]
 - headers: content-type, x-goog-api-key (values redacted)
 - body: prompt wrapping the query + tools=[{"google_search":{}}]
-- answer (first 200): **DeepSeek Harness** (often abbreviated as **dsh**) is an open-source, modular AI agent execution framework released by DeepSeek AI under the MIT license[1, 2]. It acts as an execution engine and runt
-- the provider-supplied Search Suggestion artifact (renderedContent, 4756 chars of HTML) survives to the tool output verbatim: yes (section label present: yes)
+- answer (first 200): **DeepSeek Harness** (CLI executable: `dsh`) is an open-source execution framework and agent runtime released by DeepSeek AI under the MIT license[1, 2]. It provides a modular environment for building
+- the provider-supplied Search Suggestion artifact (renderedContent, 4762 chars of HTML) survives to the tool output verbatim: yes (boundary check: the tool output content ends with the exact artifact bytes — a prefix/suffix mutation fails; section label present: yes)
 - artifact head (first 120 chars, verbatim): "<style>\n.container {\n  align-items: center;\n  border-radius: 8px;\n  display: flex;\n  font-family: Google Sans, Roboto, s"
-- inline citation markers in the answer: 17 (1-based into the 5 source(s) the tool renders after the answer)
-- 1. https://vertexaisearch.cloud.google.com/grounding-api-redirect/[token redacted] — github.com
-- 2. https://vertexaisearch.cloud.google.com/grounding-api-redirect/[token redacted] — infoq.com
-- 3. https://vertexaisearch.cloud.google.com/grounding-api-redirect/[token redacted] — thetricontinental.org
-- 4. https://vertexaisearch.cloud.google.com/grounding-api-redirect/[token redacted] — mindstudio.ai
-- 5. https://vertexaisearch.cloud.google.com/grounding-api-redirect/[token redacted] — youtube.com
+- artifact tail (last 120 chars, verbatim): "epseek+evaluation+harness&client=app-vertex-grounding&safesearch=active\">deepseek evaluation harness</a>\n  </div>\n</div>"
+- inline citation markers in the answer: 16 (1-based into the 5 source(s) the tool renders after the answer)
+- 1. https://vertexaisearch.cloud.google.com/grounding-api-redirect/[token redacted] — infoq.com
+- 2. https://vertexaisearch.cloud.google.com/grounding-api-redirect/[token redacted] — medium.com
+- 3. https://vertexaisearch.cloud.google.com/grounding-api-redirect/[token redacted] — mindstudio.ai
+- 4. https://vertexaisearch.cloud.google.com/grounding-api-redirect/[token redacted] — deepseek.com
+- 5. https://vertexaisearch.cloud.google.com/grounding-api-redirect/[token redacted] — thetricontinental.org
 
 #### 2. result limit — pass
 
 5 source(s) returned (<= 5 cap); the seam truncated an over-returning grounding response and set truncated=true
 
-- 1. https://vertexaisearch.cloud.google.com/grounding-api-redirect/[token redacted] — vellum.ai
-- 2. https://vertexaisearch.cloud.google.com/grounding-api-redirect/[token redacted] — newscatcherapi.com
-- 3. https://vertexaisearch.cloud.google.com/grounding-api-redirect/[token redacted] — olostep.com
+- 1. https://vertexaisearch.cloud.google.com/grounding-api-redirect/[token redacted] — firecrawl.dev
+- 2. https://vertexaisearch.cloud.google.com/grounding-api-redirect/[token redacted] — brightdata.com
+- 3. https://vertexaisearch.cloud.google.com/grounding-api-redirect/[token redacted] — vellum.ai
 
 #### 3. zero-grounding-sources query — pass
 
 the response carried zero grounding sources (no groundingMetadata) and was a successful zero-source result (not an error); the wire does not say whether a search ran and found nothing
 
 - request: [url redacted]
-- answer (first 200): A search for **"xkcdzyqwv98765 notarealquery"** returned no web results. The query appears to be a randomly generated string or a placeholder, as indicated by the text `notarealquery`.
+- answer (first 200): A web search for **"xkcdzyqwv98765 notarealquery"** returned no results, as this appears to be a random string or placeholder text rather than a real search topic.
 
 #### 4. non-ASCII query — pass
 
 non-ASCII query "東京 寿司" sent intact in the request body, returned 5 source(s)
 
-- 1. https://vertexaisearch.cloud.google.com/grounding-api-redirect/[token redacted] — tabelog.com
-- 2. https://vertexaisearch.cloud.google.com/grounding-api-redirect/[token redacted] — michelin.com
-- 3. https://vertexaisearch.cloud.google.com/grounding-api-redirect/[token redacted] — ikyu.com
+- 1. https://vertexaisearch.cloud.google.com/grounding-api-redirect/[token redacted] — tabiiro.jp
+- 2. https://vertexaisearch.cloud.google.com/grounding-api-redirect/[token redacted] — itmedia.co.jp
+- 3. https://vertexaisearch.cloud.google.com/grounding-api-redirect/[token redacted] — youtube.com
 
 #### 5. cancellation — pass
 

@@ -367,14 +367,21 @@ function groundedArtifactEvidence(
 		lines.push("the live response carried no provider-supplied Search Suggestion artifact (nothing to verify)");
 	} else {
 		const labelPresent = answer.includes(GEMINI_SEARCH_SUGGESTION_LABEL);
-		const verbatim = answer.includes(liveArtifact);
+		// Boundary check, not substring: the tool output content must END
+		// WITH the exact artifact bytes, so a prefix/suffix mutation (for
+		// example a trim of the artifact's trailing newline) fails the case.
+		const verbatim = answer.endsWith(liveArtifact);
 		lines.push(
 			`the provider-supplied Search Suggestion artifact (renderedContent, ${liveArtifact.length} chars of HTML) ` +
 				`survives to the tool output verbatim: ${verbatim ? "yes" : "NO"} ` +
-				`(section label present: ${labelPresent ? "yes" : "NO"})`
+				`(boundary check: the tool output content ends with the exact artifact bytes — ` +
+				`a prefix/suffix mutation fails; section label present: ${labelPresent ? "yes" : "NO"})`
 		);
 		lines.push(
 			`artifact head (first 120 chars, verbatim): ${JSON.stringify(liveArtifact.slice(0, 120))}`
+		);
+		lines.push(
+			`artifact tail (last 120 chars, verbatim): ${JSON.stringify(liveArtifact.slice(-120))}`
 		);
 	}
 	if (sources.length > 0) {
@@ -384,7 +391,7 @@ function groundedArtifactEvidence(
 				`(1-based into the ${sources.length} source(s) the tool renders after the answer)`
 		);
 	}
-	return { ok: liveArtifact === undefined || answer.includes(liveArtifact), lines };
+	return { ok: liveArtifact === undefined || answer.endsWith(liveArtifact), lines };
 }
 
 function errorText(result: ToolExecutionResult): string {
