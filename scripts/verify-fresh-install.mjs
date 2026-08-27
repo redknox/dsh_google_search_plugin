@@ -28,7 +28,12 @@ import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const tarball = resolve(process.argv[2] ?? findTarball());
+// A tarball argument is either an absolute path (local file) or an npm
+// spec (e.g. @redknox/dsh-google-search-plugin). Only absolute paths need
+// resolve(); npm specs must pass through verbatim or `dsh plugin add`
+// will mis-resolve them.
+const tarballArg = process.argv[2] ?? findTarball();
+const tarball = tarballArg.startsWith("/") ? resolve(tarballArg) : tarballArg;
 const query = process.argv[3] ?? "What is the capital of Australia?";
 const profileName = "verify";
 
@@ -108,14 +113,30 @@ try {
 	step("install via dsh plugin add", add.status === 0, add.status === 0 ? "profile auto-initialized with dsh-base" : add.out.slice(-400));
 	if (add.status !== 0) throw new Error("install failed");
 
-	// boot helper: the same composition the CLI boot path applies
+	// boot helper: the same composition the CLI boot path applies, minus
+	// the HMR entry (the verification process is a one-shot script with no
+	// process.argv[1] main entry, so cordis-plugin-hmr's
+	// resolve(process.argv[1]) crashes; file watching is irrelevant to
+	// install / activation / removal verification).
 	healProfilesModuleFallback(installAnchor, scratch);
 	async function bootProfile() {
 		const profile = loadProfile("dsh", profileName, installAnchor, scratch, { userLayer: true });
 		writeFileSync(join(profile.dir, "cordis.yml"), "# dsh profile root\n[]\n");
 		const homePatches = loadOptionalPatches("dsh", join(scratch, "cordis.patch.yml")) ?? [];
 		const bundlePatches = profile.layers.flatMap((layer) => layer.patches);
-		const allPatches = [...bundlePatches, ...profile.patches, ...homePatches];
+		const allPatches = [...bundlePatches, ...profile.patches, ...homePatches]
+			.map((patch) => {
+				// A plain entry targeted at hmr is dropped outright.
+				if (patch.id === "hmr") return null;
+				// An `insert` list is rewritten with the hmr entry removed
+				// (the patch shape is { insert: [ …entries ] }; `patch.insert`
+				// is the array, not a boolean).
+				if (Array.isArray(patch.insert) && patch.insert.some((e) => e.id === "hmr")) {
+					return { insert: patch.insert.filter((e) => e.id !== "hmr") };
+				}
+				return patch;
+			})
+			.filter((patch) => patch !== null);
 		return boot("dsh", join(profile.dir, "cordis.yml"), structuredClone(allPatches), undefined);
 	}
 	async function inspect() {
@@ -124,7 +145,7 @@ try {
 		const require2 = createRequire(join(profileDir(), "package.json"));
 		let resolved = null;
 		try {
-			resolved = require2.resolve("dsh-google-search-plugin");
+			resolved = require2.resolve("@redknox/dsh-google-search-plugin");
 		} catch {
 			/* removed */
 		}
@@ -180,7 +201,7 @@ try {
 	);
 
 	// 6. removal reverts the default route
-	const remove = dsh(["plugin", "--profile", profileName, "remove", "dsh-google-search-plugin"]);
+	const remove = dsh(["plugin", "--profile", profileName, "remove", "@redknox/dsh-google-search-plugin"]);
 	step("remove via dsh plugin remove", remove.status === 0, remove.status === 0 ? "bundle row + dependency dropped" : remove.out.slice(-400));
 	if (remove.status === 0) {
 		state = await inspect();
