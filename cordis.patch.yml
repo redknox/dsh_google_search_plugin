@@ -25,7 +25,7 @@
 # gets a clear, actionable search error rather than a silent route change.
 - insert:
     - id: google-search
-      name: 'dsh-google-search-plugin'
+      name: '@redknox/dsh-google-search-plugin'
 - id: web
   name: '@deepseek-ai/dsh-web'
   config:

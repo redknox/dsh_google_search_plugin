@@ -2,6 +2,17 @@
 
 All notable changes to this project are recorded here.
 
+## 0.1.1 (2026-08-27)
+
+### Fixed
+
+- **Scoped package name in the bundle patch**: the 0.1.0 tarball's
+  `cordis.patch.yml` referenced the unscoped package name
+  `dsh-google-search-plugin` as the loader entry's `name`. After the publish
+  moved to the scoped name `@redknox/dsh-google-search-plugin`, a registry
+  install failed at boot with `Cannot find package 'dsh-google-search-plugin'`.
+  The patch now references the scoped name.
+
 ## 0.1.0 (2026-08-26)
 
 First release candidate. The plugin ships as a DSH-native installable bundle:

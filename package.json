@@ -1,6 +1,6 @@
 {
   "name": "@redknox/dsh-google-search-plugin",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "DeepSeek Harness profile bundle that registers a Google search provider (Gemini google_search grounding) on the ctx.web seam for the web_search tool and activates it as the default search route on install",
   "type": "module",
   "license": "MIT",
