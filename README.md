@@ -250,6 +250,41 @@ fresh-home install/activation/removal evidence (needs the dsh CLI, pnpm, and a
 live `GEMINI_API_KEY`), then re-run `npm pack --dry-run` and
 `npm publish --dry-run` from the clean install.
 
+### Release checklist
+
+The 0.1.0 → 0.1.1 episode (2026-08-27) is the reference case. Treat the
+publication as a feature with its own acceptance criteria, not as "run
+`npm publish` at the end":
+
+1. **`npm publish --dry-run` does not verify name availability or
+   permissions.** It only validates the artifact contents. A name can be
+   reserved or already taken (npm answers with a 404 on the `PUT` even though
+   `GET` also 404s) and a token can lack publish scope — both only surface
+   on the real `PUT`. If the plain name is rejected, publish under a scope
+   you own (`@<account>/<name>`); scoped names are auto-created for the
+   publishing account.
+2. **Renaming the package is a contract change, not a docs change.** The
+   loader entry in `cordis.patch.yml` carries the package `name` the loader
+   resolves at boot — grep `*.yml` as well as `*.md` / `*.mjs` / `*.json`
+   when the name moves. A stale `name:` in the patch boots fine from the
+   source checkout (the module resolves locally) and only fails once
+   installed from the registry, where the on-disk directory follows the
+   published name.
+3. **After publishing, verify from the registry, not from a local tarball.**
+   ```sh
+   node scripts/verify-fresh-install.mjs @redknox/dsh-google-search-plugin
+   ```
+   Passing this with the *npm spec* as the argument is the acceptance test
+   for the publication: it installs exactly what the registry serves and
+   boots it (8 asserted steps: install, active-on-install, provider
+   registered, installed-copy resolution, live search with a key, the
+   profile-layer escape hatch, removal, default-route revert).
+4. **A buggy published version is fixed by the next version, then cleaned
+   up.** Bump the version, fix, publish — `latest` moves to the good
+   version and installs pick it up by default. The bad version can be
+   removed with `npm unpublish <pkg>@<version> --force` only within 72
+   hours (and requires the account's OTP/2FA).
+
 ## Status
 
 - **Issue #1** (closed): project-level contracts — this file, `ENGINEERING.md`, and
