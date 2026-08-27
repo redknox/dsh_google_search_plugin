@@ -5,7 +5,7 @@ All notable changes to this project are recorded here.
 ## 0.1.0 (2026-08-26)
 
 First release candidate. The plugin ships as a DSH-native installable bundle:
-`dsh plugin --profile <name> add dsh-google-search-plugin` installs the
+`dsh plugin --profile <name> add @redknox/dsh-google-search-plugin` installs the
 prebuilt artifact and routes `web_search` through Google with no further
 configuration.
 

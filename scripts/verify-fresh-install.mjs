@@ -34,7 +34,7 @@ const profileName = "verify";
 
 function findTarball() {
 	const pkg = readJson(join(repoRoot, "package.json"));
-	const name = `dsh-google-search-plugin-${pkg.version}.tgz`;
+	const name = `redknox-dsh-google-search-plugin-${pkg.version}.tgz`;
 	if (!existsSync(join(repoRoot, name))) {
 		console.error(`no tarball found; packing ${name} first…`);
 		const packed = spawnSync("npm", ["pack", "--pack-destination", "."], {
@@ -111,7 +111,7 @@ try {
 		const require2 = createRequire(join(profileDir(), "package.json"));
 		let resolved = null;
 		try {
-			resolved = require2.resolve("dsh-google-search-plugin");
+			resolved = require2.resolve("@redknox/dsh-google-search-plugin");
 		} catch {
 			/* removed */
 		}
@@ -167,7 +167,7 @@ try {
 	);
 
 	// 6. removal reverts the default route
-	const remove = dsh(["plugin", "--profile", profileName, "remove", "dsh-google-search-plugin"]);
+	const remove = dsh(["plugin", "--profile", profileName, "remove", "@redknox/dsh-google-search-plugin"]);
 	step("remove via dsh plugin remove", remove.status === 0, remove.status === 0 ? "bundle row + dependency dropped" : remove.out.slice(-400));
 	if (remove.status === 0) {
 		state = await inspect();

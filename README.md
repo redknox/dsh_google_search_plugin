@@ -1,4 +1,4 @@
-# dsh-google-search-plugin
+# @redknox/dsh-google-search-plugin
 
 A **DeepSeek Harness (DSH) plugin** that gives the agent a working web-search tool by
 registering **Google** as the first planned search backend behind DSH's web capability
@@ -78,7 +78,7 @@ its runtime implementation (all issues complete; see the Status section below).
 | `scripts/verify-fresh-install.mjs` | Fresh-home install verification (Issue #8 evidence, ENGINEERING.md §5): boots a throwaway DSH_HOME, installs the packed tarball through the real `dsh plugin` path, and asserts install, zero-config activation, installed-copy resolution, live search (with a key), the profile-layer escape hatch, and removal. Manual release-time gate (needs the dsh CLI, pnpm, and a live key). |
 | `.github/workflows/ci.yml` | Continuous verification: clean `npm ci` from the committed lockfile plus `npm run check` on every push to `main` and pull request. |
 | `CHANGELOG.md` | Notable changes per release. |
-| `package.json` / `tsconfig*.json` | ESM package + TypeScript build/test configuration (Node >= 24). `package.json` carries the DSH bundle metadata (`dsh.bundle.patch`), the publish metadata (name `dsh-google-search-plugin`, version, `publishConfig.access: public`), and the dependency split that keeps a single Harness/Cordis runtime identity: every `@deepseek-ai/cordis` / `@deepseek-ai/dsh-*` framework package is a **peer** dependency (one shared copy, provided by the host profile's `@deepseek-ai/dsh-base`), while `@deepseek-ai/schemastery` is a plain dependency. |
+| `package.json` / `tsconfig*.json` | ESM package + TypeScript build/test configuration (Node >= 24). `package.json` carries the DSH bundle metadata (`dsh.bundle.patch`), the publish metadata (name `@redknox/dsh-google-search-plugin`, version, `publishConfig.access: public`), and the dependency split that keeps a single Harness/Cordis runtime identity: every `@deepseek-ai/cordis` / `@deepseek-ai/dsh-*` framework package is a **peer** dependency (one shared copy, provided by the host profile's `@deepseek-ai/dsh-base`), while `@deepseek-ai/schemastery` is a plain dependency. |
 
 ## Development
 
@@ -169,7 +169,7 @@ absolute source path is involved.
 **Install into a profile** (e.g. the `web` profile):
 
 ```sh
-dsh plugin --profile web add dsh-google-search-plugin
+dsh plugin --profile web add @redknox/dsh-google-search-plugin
 ```
 
 `dsh plugin` forwards to `pnpm` in the profile directory, then reconciles:
@@ -209,8 +209,8 @@ same name. Never put the key in the patch file or the settings file
 **Remove / reinstall:**
 
 ```sh
-dsh plugin --profile web remove dsh-google-search-plugin   # pnpm removes it; reconciliation drops the bundle row
-dsh plugin --profile web add dsh-google-search-plugin      # re-adds it and re-activates the bundle row
+dsh plugin --profile web remove @redknox/dsh-google-search-plugin   # pnpm removes it; reconciliation drops the bundle row
+dsh plugin --profile web add @redknox/dsh-google-search-plugin      # re-adds it and re-activates the bundle row
 ```
 
 **Package contents.** The published artifact contains only what a fresh profile
