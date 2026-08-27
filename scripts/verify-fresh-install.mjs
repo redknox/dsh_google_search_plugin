@@ -75,9 +75,20 @@ const { boot, healProfilesModuleFallback, loadOptionalPatches, loadProfile } = a
 // The home must NOT live inside this repository: Node's upward module
 // resolution from the profile directory would hit the repo's own
 // node_modules (dev dependencies only) and shadow the framework fallback.
+//
+// It must also be COMPLETELY EMPTY: the boot process (this Node process)
+// resolves DSH_HOME from its own process environment — the env object below
+// only reaches the spawned `dsh` CLI, not the in-process boot. Any existing
+// file in the scratch dir (e.g. a malformed .credentials.yaml copied by a
+// failed run) would be picked up by the in-process boot and abort the
+// verification.
 const scratch = join(tmpdir(), `dsh-gsp-verify-${Date.now()}`);
 mkdirSync(scratch, { recursive: true });
-const env = { ...process.env, DSH_HOME: scratch, GEMINI_API_KEY: process.env.GEMINI_API_KEY ?? "" };
+// DSH_HOME must reach BOTH the spawned `dsh` CLI (profile management) and
+// this Node process (the in-process boot resolves DSH_HOME from its own
+// process environment). Setting it on process.env covers both.
+process.env.DSH_HOME = scratch;
+const env = { ...process.env, GEMINI_API_KEY: process.env.GEMINI_API_KEY ?? "" };
 
 const results = [];
 function step(name, ok, detail) {
@@ -85,6 +96,8 @@ function step(name, ok, detail) {
 	console.log(`${ok ? "PASS" : "FAIL"}  ${name}${detail ? ` — ${detail}` : ""}`);
 }
 function dsh(args) {
+	// The CLI is spawned with env.DSH_HOME = scratch, so it manages the
+	// profile inside the scratch home, not the user's real ~/.dsh.
 	const r = spawnSync(dshPath, args, { env, cwd: repoRoot, encoding: "utf8" });
 	return { status: r.status ?? 1, out: `${r.stdout ?? ""}${r.stderr ?? ""}` };
 }
@@ -111,7 +124,7 @@ try {
 		const require2 = createRequire(join(profileDir(), "package.json"));
 		let resolved = null;
 		try {
-			resolved = require2.resolve("@redknox/dsh-google-search-plugin");
+			resolved = require2.resolve("dsh-google-search-plugin");
 		} catch {
 			/* removed */
 		}
@@ -167,7 +180,7 @@ try {
 	);
 
 	// 6. removal reverts the default route
-	const remove = dsh(["plugin", "--profile", profileName, "remove", "@redknox/dsh-google-search-plugin"]);
+	const remove = dsh(["plugin", "--profile", profileName, "remove", "dsh-google-search-plugin"]);
 	step("remove via dsh plugin remove", remove.status === 0, remove.status === 0 ? "bundle row + dependency dropped" : remove.out.slice(-400));
 	if (remove.status === 0) {
 		state = await inspect();
